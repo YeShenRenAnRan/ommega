@@ -396,7 +396,8 @@ function collect(keepEmpty){
 /* --------------------------------- 状态 --------------------------------- */
 async function refreshStatus(){
   var r = await exec("pidof relay 2>/dev/null; echo '---'; pidof adbrd 2>/dev/null; echo '---'; " +
-                     "pidof keystore2 2>/dev/null; echo '---'; service list 2>/dev/null | grep -ci soter");
+                     "pidof keystore2 2>/dev/null; echo '---'; " +
+                     "{ service list 2>/dev/null; lshal 2>/dev/null; } | grep -ci soter");
   var p = r.stdout.split("---");
   function first(s){ s = (s || "").trim(); return s ? s.split(/\s+/)[0] : ""; }
   [["st-relay", first(p[0])], ["st-adbrd", first(p[1])], ["st-keystore", first(p[2])]].forEach(function(pair){
@@ -404,8 +405,12 @@ async function refreshStatus(){
       ? '<i class="dot on"></i>' + t("status.running", {p: pair[1]})
       : '<i class="dot off"></i>' + t("status.stopped");
   });
-  /* SOTER：看 HAL 服务注册没注册（这台是 vendor.trustonic.hardware.soter），
-     名字里带 soter 就算在 —— 各家叫法不一样，只认这一族关键词。 */
+  /* SOTER：看 HAL 服务注册没注册。名字里带 soter 就算在 —— 各家叫法不一样，
+     只认这一族关键词。
+     两张表都要查：`service list` 是 binder 的 servicemanager（AIDL 形态，
+     vendor.qti.hardware.soter.ISoter），`lshal` 是 hwservicemanager（HIDL 形态，
+     vendor.qti.hardware.soter@1.0::ISoter）。天玑机大多只有后者，只查前者会把
+     "明明能用"报成"未找到" —— relay 自己的后端探测两边都试，这里跟着对齐。 */
   var n = parseInt((p[3] || "").trim(), 10) || 0;
   document.getElementById("st-soter").innerHTML = n > 0
     ? '<i class="dot on"></i>' + t("status.registered")
