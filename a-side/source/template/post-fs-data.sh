@@ -37,10 +37,12 @@ if [ ! -x "$RESETPROP_BIN" ]; then
 fi
 resetprop() { "$RESETPROP_BIN" "$@"; }
 
-resetprop persist.logd.size ""
-resetprop persist.logd.size.crash ""
-resetprop persist.logd.size.system ""
-resetprop persist.logd.size.main ""
+# persist.* 要带 -p：不带的话只改内存属性区，init 落在 /data/property/ 的那份镜像
+# 不会跟着变，两边一对就露（检测项 device.property.persistent_suspicious）。
+resetprop -p persist.logd.size ""
+resetprop -p persist.logd.size.crash ""
+resetprop -p persist.logd.size.system ""
+resetprop -p persist.logd.size.main ""
 resetprop ro.boot.flash.locked 1
 resetprop ro.boot.verifiedbootstate green
 resetprop ro.boot.veritymode enforcing

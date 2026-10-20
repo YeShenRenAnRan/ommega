@@ -391,8 +391,7 @@ impl crate::KeyMintTa {
         &mut self,
         params: &[KeyParam],
         attestation_key: Option<AttestationKey>,
-    ) -> Result<KeyCreationResult, Error> {
-        // Remote mode: if a remote backend is enabled and attestation is
+    ) -> Result<KeyCreationResult, Error> {        // Remote mode: if a remote backend is enabled and attestation is
         // requested, mint the key on the B-side real TEE instead of locally.
         // A caller-supplied attestation key (e.g. KeyAttestation's persistent
         // key) must NOT go remote: the remote backend ignores it and mints

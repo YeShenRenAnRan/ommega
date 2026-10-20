@@ -118,61 +118,69 @@ fn op_name(code: u32) -> &'static str {
 /// `int xxx(out byte[] data)` 那一类：返回值 + AIDL 原生 byte[]。
 /// 不是 `SoterBufferReturn` parcelable —— cryptoeng（C++ ndk 客户端）的反汇编里就是
 /// 一个 vector<uint8_t> out 加一个 int 返回，按 parcelable 拼它会在解析时越界崩。
-/// 调用方是不是 SOTER 宿主（`com.tencent.soter.soterserver`）。
 ///
-/// 两家客户端读同一条 AIDL 的回复形状不一样：宿主的 Java 代理按 `SoterBufferReturn`
-/// **parcelable** 读（[非空标记][总长][byte[]][dataLength]），oplus 的 cryptoeng（C++）
-/// 读的是 `int + 原生 byte[]`。给错形状不会报错，只会把数据解成垃圾（宿主那边就是
-/// `askModel` 拿不到、“系统错误”，工程模式那边也会崩）。
-fn caller_is_soter_host() -> bool {
+/// 除这一类，其余全按 parcelable 给：soterserver、SoterChecker、工程模式那页都是
+/// Java 客户端，读的就是 `SoterBufferReturn`（[非空标记][总长][byte[]][dataLength]）。
+///
+/// 以前只认 soterserver 一个进程名，其余一律给原生形状 —— 结果所有第三方/自带的 Java
+/// 检测器都把数据解成垃圾（2026-10-20 SoterChecker 报告：`len=825 data=0`、
+/// `short blob len=0`）。反过来判断之后，「给原生」变成一个要手动点名的例外。
+///
+/// 名单：环境变量 `OMMEGA_SOTER_NATIVE_CALLERS`（逗号分隔，按 cmdline 包含匹配）。
+/// 空字符串 = 全部走 parcelable。
+fn caller_wants_parcelable() -> bool {
     let pid = rsbinder::get_calling_pid();
+    // 拿不到调用者就别赌：Java 客户端占绝大多数，给原生形状只会把人家数据弄坏。
     if pid <= 0 {
+        return true;
+    }
+    let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return true;
+    };
+    let name = raw.split(|byte| *byte == 0).next().unwrap_or_default();
+    !is_native_caller(name)
+}
+
+/// 缺省走原生形状的那几个（进程名包含匹配）。oplus 的 cryptoeng 是产线/CDK 那种工具，
+/// 平时不出现；出现时给它原生形状，否则它按 parcelable 解析会越界崩。
+const DEFAULT_NATIVE_CALLERS: &str = "cryptoeng";
+
+fn is_native_caller(name: &[u8]) -> bool {
+    if name.is_empty() {
         return false;
     }
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .ok()
-        .and_then(|raw| {
-            raw.split(|byte| *byte == 0)
-                .next()
-                .map(|first| first.ends_with(b"com.tencent.soter.soterserver"))
-        })
-        .unwrap_or(false)
+    let list = std::env::var("OMMEGA_SOTER_NATIVE_CALLERS")
+        .unwrap_or_else(|_| DEFAULT_NATIVE_CALLERS.to_string());
+    list.split(',')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| contains_bytes(name, pattern.as_bytes()))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// `int xxx(out SoterBufferReturn)` 那一类：按调用方选形状。
 fn write_bytes_reply(reply: &mut Parcel, data: &[u8], code: i32) -> BinderResult<()> {
-    let host = caller_is_soter_host();
+    let parcelable = caller_wants_parcelable();
     log::info!(
-        "event=soterta shape host={host} code={code} data={}",
+        "event=soterta shape parcelable={parcelable} code={code} data={}",
         data.len()
     );
     reply.write_i32(code)?;
-    if host {
-        // `SoterExportResult` 外面包一层 Parcelable 的 [非空][长度]。两代系统的区别：
-        // Android 16 = [长度][byte[]][dataLength]；Android 17 多一个 resultCode，变成
-        // [长度][resultCode][byte[]][dataLength]（见 A17 `f/b.java` 的 `a(Parcel)`）。
-        // 漏写或错位都会让微信读出来的公钥变乱码，它一验不过就删了重建。
-        let sdk: i32 = soter_local::prop("ro.build.version.sdk")
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0);
+    if parcelable {
+        // AIDL 的 parcelable 只有 `[非空标记][总长][byte[]][dataLength]`，里面的 resultCode
+        // 就是**方法返回值**（上一行）那一格，parcelable 里**没有**第二份。
+        //
+        // 1.7.4 曾经给 Android 17 多加过一格 resultCode（`[总长][resultCode][byte[]][dataLength]`），
+        // 那是错的：总长后面直接就是 byte[]，多写 4 字节会把 byte[] 的长度顶成 0，
+        // 读端拿到 `len=825 data=0`（SoterChecker 的 T3 / C1 / X 三条 fail 就是这么来的）。
         reply.write_i32(1)?;
-        if sdk >= 37 {
-            // Android 17 的 `SoterExportResult`（`f/b.java` 的 `a(Parcel)`）：
-            // [Parcelable长度][resultCode][byte[]][exportDataLength]，外面再一层 [非空]。
-            // 漏掉 resultCode 会把后面全部顶偏，微信读到的公钥是乱码。
-            // 长度按 OhMyKeymint 的 buffer_return 口径：[len 前缀 4][resultCode 4][数据对齐][字段尾 4]。
-            let padded = (data.len() + 3) & !3;
-            reply.write_i32((16 + padded) as i32)?;
-            reply.write_i32(0)?;
-            reply.write(&data.to_vec())?;
-            reply.write_i32(data.len() as i32)?;
-        } else {
-            // SoterBufferReturn.writeToParcel：[总长][byte[]][dataLength]，总长从自己那 4 字节算起。
-            let padded = (data.len() + 3) & !3;
-            reply.write_i32((12 + padded) as i32)?;
-            reply.write(&data.to_vec())?;
-            reply.write_i32(data.len() as i32)?;
-        }
+        let padded = (data.len() + 3) & !3;
+        reply.write_i32((12 + padded) as i32)?;
+        reply.write(&data.to_vec())?;
+        reply.write_i32(data.len() as i32)?;
     } else {
         reply.write(&data.to_vec())?;
     }

@@ -1456,11 +1456,11 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
        注意 LD_LIBRARY_PATH 只加给目标程序，别污染 timeout 自己的链接搜索路径。 */
     document.getElementById("rkp-fix").onclick = function(){
       runBusy("rkp-fix", t("kb.rkp.working"), function(){
+        /* 直接跑写 ID 命令，不预先判断—— 判断只能靠猜，跑一遍才知道成不成。
+           参数一律用占位符 `true rkp`：只写设备 ID，绝不把真 keybox 写进设备。 */
         var script = [
           "MOD=" + MOD + ";",
           "LIB=/vendor/lib64:/vendor/lib64/hw;",
-          "if [ -x /vendor/bin/rkp_factory_extraction_tool ]; then timeout 15 env LD_LIBRARY_PATH=$LIB /vendor/bin/rkp_factory_extraction_tool default 8 2>/dev/null | grep -q csr && { echo RKP_ALREADY_OK; exit 0; };",
-          "elif [ \"$(getprop remote_provisioning.enable_rkpd)\" = true ]; then echo RKP_USES_RKP; exit 0; fi;",
           "try() { OUT=$(LD_LIBRARY_PATH=\"$1\" \"$2\" Keybox_file Device_ID true rkp 2>&1); echo \"$OUT\"; echo \"$OUT\" | grep -qi -e 'is done' -e 'provisioning complete'; };",
           "if [ -x /vendor/bin/KmInstallKeybox ]; then try /vendor/lib64:/vendor/lib64/hw /vendor/bin/KmInstallKeybox && exit 0; fi;",
           "if [ -x $MOD/KmInstallKeybox ]; then try /vendor/lib64/hw:/vendor/lib64 $MOD/KmInstallKeybox && exit 0; fi;",
@@ -1468,11 +1468,8 @@ document.addEventListener("change", function(ev){ if (!(ev && ev.target && ev.ta
         ].join(" ");
         return exec(script).then(function(r){
           var out = ((r.stdout || "") + (r.stderr || "")).trim();
-          if (out.indexOf("RKP_ALREADY_OK") >= 0){ toast(t("kb.rkp.already")); return; }
-          if (out.indexOf("RKP_USES_RKP") >= 0){ toast(t("kb.rkp.usesrkp")); return; }
-          if (out.indexOf("RKP_NOBIN") >= 0){ toast(t("kb.rkp.nobin"), true); return; }
           if (out.indexOf("RKP_WRITE_FAIL") >= 0){ toast(t("kb.rkp.fail", {msg: out.replace("RKP_WRITE_FAIL", "").trim().slice(-140) || "-"}), true); return; }
-          if (/provision.{0,40}complete/i.test(out)){ toast(t("kb.rkp.ok")); return; }
+          if (/provision.{0,40}complete/i.test(out) || /is done/i.test(out)){ toast(t("kb.rkp.ok")); return; }
           toast(t("kb.rkp.fail", {msg: out.slice(-160) || ("errno " + r.errno)}), true);
         });
       });

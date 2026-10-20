@@ -29,6 +29,7 @@
 //! captured replies, see [`fixtures`]).
 
 pub mod fixtures;
+pub mod flow;
 pub mod hal;
 pub mod hal_restart;
 pub mod hidl;

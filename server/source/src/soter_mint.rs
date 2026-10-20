@@ -597,9 +597,11 @@ fn touch_owner(slot_id: &str, family: &str, value: &str) {
 
 /// uid 级全清要不要降级成「只答成功、不真清」。
 ///
-/// 默认开。`RELAY_SOTER_SCOPE_WIPE=0` 关掉（回滚用，不用重新编译）。
+/// **默认不降级（真清）。** 接口说删就得删：答成功却没删，应用唯一的自救路径就失效
+/// 了 —— 2026-10-20 实测微信就是踩这条进死循环（答 0 之后 `has_ask_already` 还是 0，
+/// 它就一直重建）。真要保留旧的「防连坐」降级，设 `RELAY_SOTER_SCOPE_WIPE=1`。
 fn scope_wipe_from(value: Option<&str>) -> bool {
-    !matches!(value, Some("0") | Some("false") | Some("no") | Some("off"))
+    matches!(value, Some("1") | Some("true") | Some("yes") | Some("on"))
 }
 
 pub fn scope_wipe_enabled() -> bool {
@@ -1706,12 +1708,13 @@ mod tests {
     }
 
     #[test]
-    fn the_wipe_downgrade_switch_defaults_on() {
-        assert!(scope_wipe_from(None));
-        assert!(scope_wipe_from(Some("1")));
-        assert!(scope_wipe_from(Some("true")));
-        for off in ["0", "false", "no", "off"] {
-            assert!(!scope_wipe_from(Some(off)), "{off} 应该关掉降级");
+    fn the_wipe_downgrade_is_off_by_default() {
+        assert!(!scope_wipe_from(None));
+        for on in ["1", "true", "yes", "on"] {
+            assert!(scope_wipe_from(Some(on)), "{on} 应该打开降级");
+        }
+        for off in ["0", "false", "no", "off", ""] {
+            assert!(!scope_wipe_from(Some(off)), "{off} 不降级（真清）");
         }
     }
 

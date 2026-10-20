@@ -21,6 +21,8 @@ STATE_DIR=/data/adb/ommega
 CONF=${OMMEGA_CONF_PATH:-/data/misc/keystore/ommega/config}
 PIDFILE=$STATE_DIR/soterta.pid
 KICKED_FILE=$STATE_DIR/soterta.host.kicked
+# 最后一次踢宿主时对应的 TA 实例（pid）。换实例就要重踢，见 kick_host。
+TAKEOVER_PID=$STATE_DIR/soterta.takeover.pid
 LOG=$STATE_DIR/logs/soterta.log
 SERVICE=vendor.qti.hardware.soter.ISoter/default
 HAL=vendor.soter
@@ -67,6 +69,20 @@ find_bin() {
   return 1
 }
 
+# daemon-injector 每轮注入前会 `pkill -9 -f "$TARGET_INJECTOR"` 清残留，而它的
+# TARGET_INJECTOR 跟我们的宿主同名。宿主直接用那个路径就会被连带杀掉（实测每 20 秒
+# 一轮），服务名反复重建、宿主握不住，App 一调就是系统错误。
+# 拷一份到独立文件名，离开那条 pkill 的匹配。
+stage_bin() {
+  [ -n "$BIN" ] || return 1
+  dst="$STATE_DIR/soterta-ta"
+  if [ ! -x "$dst" ] || ! cmp -s "$BIN" "$dst" 2>/dev/null; then
+    cp -f "$BIN" "$dst.tmp" 2>/dev/null && chmod 755 "$dst.tmp" && mv -f "$dst.tmp" "$dst"
+  fi
+  [ -x "$dst" ] && BIN=$dst
+  return 0
+}
+
 hal_state() {
   value=$(getprop "init.svc.$HAL" 2>/dev/null)
   [ -n "$value" ] && echo "$value" || echo unknown
@@ -105,18 +121,21 @@ stop_daemon() {
 # 我们的守护。启动失败就退回去把原厂 HAL 拉起来，不能把整台机的 SOTER 留成死的。
 take_over() {
   find_bin || { log "injector binary not found"; return 1; }
-  if [ -z "$(daemon_pid)" ]; then
-    log "starting software SOTER TA: $BIN"
-    "$BIN" --soterta-serve >>"$LOG" 2>&1 &
-    pid=$!
-    echo "$pid" > "$PIDFILE.tmp" 2>/dev/null
-    mv -f "$PIDFILE.tmp" "$PIDFILE" 2>/dev/null
-    sleep 1
-  fi
+  stage_bin
+  # 服务名只有一个 owner：原厂 HAL 还在跑的时候我们注册不上去（servicemanager 直接拒），
+  # 所以**先停原厂、再起守护**。顺序反过来的话每一轮都是「起守护→注册失败→停原厂→
+  # 再查服务名→没有→判 takeover failed→拉回原厂」（2026-10-20 PKX110 上实测空转 1507 次）。
   if [ "$(hal_state)" = "running" ]; then
     log "stopping stock SOTER HAL"
     setprop ctl.stop "$HAL" 2>/dev/null
     sleep 1
+  fi
+  if [ -z "$(daemon_pid)" ]; then
+    start_daemon
+  elif ! service_present; then
+    # 守护还活着但手上没有服务名：它是在原厂占着名字的时候起来的，重起一个再试。
+    log "software SOTER TA is up but holds no service name; restarting it"
+    start_daemon restart
   fi
   if [ -z "$(daemon_pid)" ] || ! service_present; then
     log "takeover failed, restoring stock HAL"
@@ -126,14 +145,40 @@ take_over() {
   fi
   # 宿主（soterserver）把 HAL 代理缓存在 static 字段里，我们一换服务实例那份代理就死了，
   # 但它不会自己重查 —— App 一调就 DeadObjectException（微信直接「系统错误」，而日志里
-  # 一笔 HAL 调用都看不到）。刚接管完就把宿主踢一下，让 AM 下回 bind 时重新拿。
-  host_pid=$(pidof com.tencent.soter.soterserver 2>/dev/null | awk '{print $1}')
-  if [ -n "$host_pid" ] && [ ! -f "$KICKED_FILE" ]; then
-    log "restarting soter host pid=$host_pid so it rebinds our service"
-    kill -9 "$host_pid" 2>/dev/null
-    : > "$KICKED_FILE" 2>/dev/null
-  fi
+  # 一笔 HAL 调用都看不到）。详见 kick_host。
+  kick_host
   return 0
+}
+
+# 起守护并等它把服务名注册上。`restart` 表示先收掉旧的那个。
+start_daemon() {
+  if [ "$1" = "restart" ]; then
+    stop_daemon
+  fi
+  log "starting software SOTER TA: $BIN"
+  "$BIN" --soterta-serve >>"$LOG" 2>&1 &
+  pid=$!
+  echo "$pid" > "$PIDFILE.tmp" 2>/dev/null
+  mv -f "$PIDFILE.tmp" "$PIDFILE" 2>/dev/null
+  sleep 1
+}
+
+# 宿主手里缓存的是旧服务实例的代理，**每换一次 TA 实例就得踢一次**。
+#
+# 所以记的是「踢过哪个 TA 实例」（$TAKEOVER_PID 里存那次的 pid），而不是「踢过一次没有」：
+# 旧的那套 `soterta.host.kicked` 只踢一次，之后换 TA 就全瞎了 —— 2026-10-20 实测换完
+# 新 TA 所有客户端都报系统错误，得手动删标记再踢一次才恢复。
+#
+# 幂等：同一个 TA 实例只踢一次。take_over 成功时调一次，hold 每轮也调一次。
+kick_host() {
+  host_pid=$(pidof com.tencent.soter.soterserver 2>/dev/null | awk '{print $1}')
+  ta_pid=$(cat "$PIDFILE" 2>/dev/null)
+  kicked_ta=$(cat "$TAKEOVER_PID" 2>/dev/null)
+  if [ -n "$host_pid" ] && [ -n "$ta_pid" ] && [ "$kicked_ta" != "$ta_pid" ]; then
+    log "restarting soter host pid=$host_pid so it rebinds our service (ta=$ta_pid)"
+    kill -9 "$host_pid" 2>/dev/null
+    echo "$ta_pid" > "$TAKEOVER_PID" 2>/dev/null
+  fi
 }
 
 # 原厂 HAL 被谁拉回来了（init 重启、别的模块 ctl.start）就再抢一次：服务名被抢走时
@@ -147,6 +192,8 @@ hold() {
     log "stock HAL came back or our service vanished; re-taking over"
     take_over && return 0
   fi
+  # 服务名和守护都正常，但 TA 实例可能已经换过了（被重新拉起）：那也得重踢。
+  kick_host
 }
 
 release() {

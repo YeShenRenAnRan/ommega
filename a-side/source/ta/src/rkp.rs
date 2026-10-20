@@ -325,11 +325,17 @@ impl KeyMintTa {
             )?;
         }
         // Construct the `CsrPayload`
-        let rpc_device_info = self.rpc_device_info_cbor()?;
+        // 第三个元素必须是 **CBOR 编码后的字节串**（CDDL: `device_info: bstr`）。
+        // 以前直接把 `Value::Map` 塞进去，解析端按 bstr 读会把这个 map 的头
+        // `0xae`（= map(14)）当成「14 字节的字节串」，于是报
+        // `Need 14 byte(s) for byte string, have 3.`，整个 RKP provisioning 作废：
+        // rkpdapp 拿不到 key 就转去找 GMSCore，工程模式的 Attestation key 和
+        // RKP widevine 两项都跟着红。
+        let rpc_device_info = serialize_cbor(&self.rpc_device_info_cbor()?)?;
         let csr_payload = Value::Array(vec![
             Value::Integer(self.rpc_info.get_version().into()),
             Value::Text(String::from(CERT_TYPE_KEYMINT)),
-            rpc_device_info,
+            Value::Bytes(rpc_device_info),
             Value::Array(pub_cose_keys),
         ]);
         let csr_payload_data = serialize_cbor(&csr_payload)?;

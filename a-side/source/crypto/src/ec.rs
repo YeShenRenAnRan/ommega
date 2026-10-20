@@ -27,6 +27,7 @@ use kmr_common::{
     explicit, km_err, Error, FallibleAllocExt,
 };
 use kmr_wire::keymint::{self, Digest, EcCurve};
+use p224::ecdsa::Signature as SigP224;
 use p256::ecdsa::Signature as SigP256;
 use p384::ecdsa::Signature as SigP384;
 
@@ -376,7 +377,15 @@ impl crypto::AccumulatingOperation for OmmegaEcUndigestSignOperation {
 fn sign_ecdsa(key: &Key, curve: ec::NistCurve, msg: &[u8]) -> Result<Vec<u8>, Error> {
     let priv_bytes = nist_priv_bytes(key)?;
     let sig = match curve {
-        ec::NistCurve::P224 => return Err(km_err!(UnsupportedEcCurve, "P-224 ECDSA unsupported")),
+        // P-224 只有工程模式那类自检会要（`KeyAttestationTest.testEcAttestation` 用的就是
+        // secp224r1）。以前这里直接回 UnsupportedEcCurve，于是工程模式的
+        // `isGoogleKeyImport()` 抛异常 → 「Attestation key 失败」。
+        ec::NistCurve::P224 => {
+            let sk = EcdsaSigningKey::<p224::NistP224>::from_slice(&priv_bytes)
+                .map_err(|e| km_err!(UnknownError, "P-224 key: {e:?}"))?;
+            let s: SigP224 = sk.sign(msg);
+            s.to_der().to_vec()
+        }
         ec::NistCurve::P256 => {
             let sk = EcdsaSigningKey::<p256::NistP256>::from_slice(&priv_bytes)
                 .map_err(|e| km_err!(UnknownError, "P-256 key: {e:?}"))?;

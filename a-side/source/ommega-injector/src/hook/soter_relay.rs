@@ -62,6 +62,13 @@ fn resolve(call: &SoterCall) -> Outcome {
 
 /// 只读 op 的缓存槽名；写 op / 签名类返回 `None`（同时意味着要清缓存）。
 fn cache_slot(call: &SoterCall) -> Option<String> {
+    // 1.7.4 加的只读 op 本地缓存先关掉：微信开通一轮里会反复问 has_ask_already /
+    // export_ask_public_key，而它自己又在清场重建。缓存把「清场前那把 ASK」多续三秒，
+    // 微信拿到的一直是旧钥匙，比不过就再清一轮 —— 表现就是建了立刻删。
+    // 1.7.3 没有这个缓存，先回到那个行为。
+    let _ = call;
+    return None;
+    #[allow(unreachable_code)]
     let op = soter_relay::op_for_code(call.code)?;
     let readable = matches!(
         op,

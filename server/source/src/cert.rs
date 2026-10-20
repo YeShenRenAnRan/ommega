@@ -1086,7 +1086,11 @@ pub fn generate_leaf_key(p: &AttestationParams) -> anyhow::Result<(KeyMaterial, 
 
     if p.algorithm == KM_ALG_RSA {
         let mut rng = rand::rngs::OsRng;
-        let size = if p.key_size >= 1024 && p.key_size <= 8192 {
+        // 下限放到 512：一加/OPPO 工程模式的 `KeyAttestationTest` 就拿 512 位 RSA 自检，
+        // 而以前这里把 <1024 的请求**静默改成 2048**：签出来的叶证书是 2048 位，
+        // attestation extension 里声明的却是 512，工程模式一比就报
+        // `Failed on key size 512`，连带 `Attestation key` 判失败。
+        let size = if (512..=8192).contains(&p.key_size) {
             p.key_size as usize
         } else {
             2048
