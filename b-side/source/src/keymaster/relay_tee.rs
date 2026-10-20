@@ -5,8 +5,11 @@
 //! keymint HAL, **without** pulling in the rest of the (software) keystore
 //! stack:
 //!
-//!   * `get_system_keymint` / `clear_system_keymint` — connect (and cache) the
-//!     real TEE `IKeyMintDevice` binder proxy;
+//!   * `get_real_keymint` — connect (and cache) the real TEE HAL this device
+//!     actually exposes: AIDL `IKeyMintDevice` when present, HIDL
+//!     keymaster@4.x otherwise;
+//!   * `get_system_keymint` / `clear_system_keymint` — the AIDL-only half of
+//!     that (binder proxy + death recipient);
 //!   * `key_params_to_aidl` — convert `kmr_wire::KeyParam` (the canonical,
 //!     wire-format key parameters) into the AIDL `KeyParameter` list the real
 //!     HAL understands;
@@ -25,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use kmr_wire::keymint::KeyParam;
 use log::error;
 use rsbinder::{hub, DeathRecipient, FromIBinder, StatusCode, Strong, WIBinder};
@@ -36,6 +39,7 @@ use crate::android::hardware::security::keymint::{
     KeyParameter::KeyParameter as KmKeyParameter, KeyParameterValue::KeyParameterValue,
     KeyPurpose::KeyPurpose, MlDsaVariant::MlDsaVariant as AidlMlDsaVariant, Tag::Tag,
 };
+use crate::keymaster::hidl_km::{HidlKeymaster, KM4_FQNAME_V40, KM4_FQNAME_V41};
 
 // ---------------------------------------------------------------------------
 // HAL version constants (previously defined on `KeyMintDevice`).
@@ -372,6 +376,165 @@ pub fn clear_system_keymint(_service: &'static str) {
     // simple (single counter) avoids per-service atomic bookkeeping.
     KEYMINT_CACHE_GEN.fetch_add(1, Ordering::Release);
     log::warn!("system KeyMint cache invalidated (generation bumped); all threads will reconnect on next use");
+}
+
+// ---------------------------------------------------------------------------
+// Dual backend: AIDL KeyMint vs HIDL keymaster@4.x.
+// ---------------------------------------------------------------------------
+
+/// Which HAL family the real TEE is spoken over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealBackend {
+    Aidl,
+    Hidl,
+}
+
+/// A connected real-TEE keymaster handle.
+///
+/// Android 12+ mandates AIDL KeyMint, but a device that *launched* on an older
+/// release is grandfathered onto HIDL keymaster — the Dimensity 1200 (MT6893)
+/// is such a part.  It registers `android.hardware.keymaster@4.x` and no
+/// `android.hardware.security.keymint` at all, which is why a KeyMint-only
+/// client reports `NameNotFound` and the local real-TEE path looks broken
+/// rather than unsupported.
+pub enum RealKeymint {
+    Aidl(Strong<dyn IKeyMintDevice>),
+    Hidl(Arc<HidlKeymaster>),
+}
+
+impl RealKeymint {
+    /// Short backend tag, for log lines and error text.
+    pub fn backend(&self) -> &'static str {
+        match self {
+            RealKeymint::Aidl(_) => "AIDL KeyMint",
+            RealKeymint::Hidl(_) => "HIDL keymaster@4.x",
+        }
+    }
+}
+
+thread_local! {
+    /// Per-service backend choice, remembered so a device with no AIDL KeyMint
+    /// does not re-run the AIDL diagnosis (which enumerates the service list)
+    /// on every single operation.
+    static REAL_BACKEND_CHOICE: RefCell<Option<HashMap<&'static str, RealBackend>>> =
+        const { RefCell::new(None) };
+    /// Generation snapshot for the choice cache above.
+    static REAL_BACKEND_CHOICE_GEN: RefCell<u64> = const { RefCell::new(0) };
+    /// The HIDL device plus its `/dev/hwbinder` connection.
+    ///
+    /// HIDL has no `link_to_death` we can hook the way AIDL does, so a dead
+    /// device is noticed by the transact failing; the caller then calls
+    /// [`clear_hidl_keymaster`] and the next call reopens.  This is per thread:
+    /// another thread holding a stale connection finds out the same way.
+    static HIDL_KEYMASTER_CACHE: RefCell<Option<Arc<HidlKeymaster>>> = const { RefCell::new(None) };
+}
+
+/// Connects to whichever real-TEE keymaster HAL this device actually has.
+///
+/// AIDL KeyMint is tried first — it is what Android 12+ mandates, and what the
+/// existing cache, death recipient and AIDL parameter encoder are built for.
+/// Only when that lookup fails do we fall back to HIDL keymaster@4.x.
+///
+/// The fallback is deliberately not silent: when both fail, both reasons are
+/// reported, so a HAL that is present but broken is never mistaken for a device
+/// that simply predates AIDL.
+pub fn get_real_keymint(service: &'static str) -> Result<RealKeymint> {
+    // Only the TEE (`/default`) instance may fall back to HIDL.  A missing
+    // StrongBox HAL has to keep failing: the A-side maps that to "StrongBox
+    // unavailable" and uses its local keybox, which is correct — answering a
+    // StrongBox request out of the HIDL TEE keymaster would return a TEE chain
+    // for a request the caller explicitly made for StrongBox.  (`connect_keymint`
+    // applies the same rule to its alternate-instance fallback.)
+    let hidl_allowed = service.ends_with("/default");
+
+    // Mirror the AIDL cache: a bump means some thread saw a death, so the
+    // previously chosen backend has to be reconsidered.
+    let global_gen = KEYMINT_CACHE_GEN.load(Ordering::Acquire);
+    let stale = REAL_BACKEND_CHOICE_GEN.with(|g| *g.borrow() != global_gen);
+    if stale {
+        REAL_BACKEND_CHOICE.with(|choice| *choice.borrow_mut() = None);
+        REAL_BACKEND_CHOICE_GEN.with(|g| *g.borrow_mut() = global_gen);
+    }
+
+    let chosen = REAL_BACKEND_CHOICE.with(|choice| {
+        choice
+            .borrow()
+            .as_ref()
+            .and_then(|services| services.get(service).copied())
+    });
+    match chosen {
+        Some(RealBackend::Aidl) => return Ok(RealKeymint::Aidl(get_system_keymint(service)?)),
+        Some(RealBackend::Hidl) => return Ok(RealKeymint::Hidl(get_hidl_keymaster()?)),
+        None => {}
+    }
+
+    match get_system_keymint(service) {
+        Ok(keymint) => {
+            remember_backend(service, RealBackend::Aidl);
+            Ok(RealKeymint::Aidl(keymint))
+        }
+        // The AIDL error already carries `keymint_diagnosis`, so pass it through
+        // untouched when HIDL is not an option for this service name.
+        Err(aidl_err) if !hidl_allowed => Err(aidl_err),
+        Err(aidl_err) => match get_hidl_keymaster() {
+            Ok(km) => {
+                log::info!(
+                    "no AIDL KeyMint for '{service}' ({aidl_err}); \
+                     falling back to HIDL {}",
+                    km.version().fq_name()
+                );
+                remember_backend(service, RealBackend::Hidl);
+                Ok(RealKeymint::Hidl(km))
+            }
+            Err(hidl_err) => Err(anyhow!(
+                "no usable real TEE keymaster HAL for '{service}': \
+                 AIDL KeyMint: {aidl_err}; HIDL keymaster@4.x: {hidl_err}"
+            )),
+        },
+    }
+}
+
+fn remember_backend(service: &'static str, backend: RealBackend) {
+    REAL_BACKEND_CHOICE.with(|choice| {
+        choice
+            .borrow_mut()
+            .get_or_insert_with(HashMap::new)
+            .insert(service, backend);
+    });
+}
+
+/// Opens (and caches for this thread) the HIDL keymaster@4.x device.
+fn get_hidl_keymaster() -> Result<Arc<HidlKeymaster>> {
+    HIDL_KEYMASTER_CACHE.with(|cache| {
+        if let Some(km) = cache.borrow().as_ref() {
+            return Ok(km.clone());
+        }
+        // `open` probes @4.1 then @4.0 and returns Ok(None) when the device
+        // registers neither; that is the Android 10-and-earlier situation
+        // (HIDL keymaster@3.0 only), which this client does not speak.
+        let Some(km) = HidlKeymaster::open()? else {
+            bail!(
+                "neither {KM4_FQNAME_V41} nor {KM4_FQNAME_V40} is registered with hwservicemanager"
+            );
+        };
+        log::info!(
+            "HIDL keymaster opened: {} (hal_version {})",
+            km.version().fq_name(),
+            km.version().hal_version()
+        );
+        let km = Arc::new(km);
+        *cache.borrow_mut() = Some(km.clone());
+        Ok(km)
+    })
+}
+
+/// Drops this thread's HIDL connection so the next call reopens it.
+///
+/// The backend *choice* is kept on purpose: reopening costs one `getService`,
+/// whereas re-deciding would re-run the whole AIDL diagnosis, and a device that
+/// had no AIDL KeyMint a moment ago still has none.
+pub fn clear_hidl_keymaster() {
+    HIDL_KEYMASTER_CACHE.with(|cache| *cache.borrow_mut() = None);
 }
 
 // ---------------------------------------------------------------------------

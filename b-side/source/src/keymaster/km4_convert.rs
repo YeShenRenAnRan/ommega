@@ -14,6 +14,15 @@
 //! 只做单向（wire → KM4）。`getKeyCharacteristics` 回来的参数我们不读：`tee_ops.rs`
 //! 里没有任何一处用到 `KeyCharacteristics`，`kmr_wire` 也没有对应的 wire 类型。
 //! 等真需要读的时候再补反向，别现在写一份没人用的代码。
+//!
+//! **tag 内部的枚举值也不用换算**，这一点逐项核对过 KM4 4.0 `types.hal`：`KeyPurpose`
+//! （4 保留，`WRAP_KEY` 仍是 5）、`PaddingMode`、`Digest`、`Algorithm`、`BlockMode`、
+//! `EcCurve`、`KeyOrigin`、`HardwareAuthenticatorType` 与 KeyMint 的值全部一致。
+//! 只有三个值 KM4 里不存在 —— `KeyPurpose::AgreeKey`(6)、`KeyPurpose::AttestKey`(7)、
+//! `EcCurve::Curve25519`(4)。b-side 的实际路径到不了它们（只做 EcP256，且
+//! `ATTEST_KEY` 在 `build_attestation_params` 里就被剥掉了），所以不做值重映射；
+//! 硬要重映射反而会把「TEE 拒绝了不认识的 purpose」这种真问题掩盖掉。
+//! `enum_values_match_km4_types_hal` 盯着这份结论。
 
 use kmr_wire::keymint::KeyParam;
 use log::warn;
@@ -124,10 +133,61 @@ pub fn param_to_km4(param: KeyParam) -> Option<KmParam> {
     Some(out)
 }
 
+/// 把认证类参数从密钥参数里拆出来，供 KM4 的两段式生成使用。
+///
+/// KeyMint 是 `generateKey(keyParams, attestKeyParams)` **一次**就把认证链带回来；
+/// KM4 的 `generateKey(vec<KeyParameter> keyParams)` 只回
+/// `(ErrorCode, keyBlob, KeyCharacteristics)`，**根本没有 attestParams 这个参数**。
+/// 认证链单独在
+/// `attestKey(vec<uint8_t> keyToAttest, vec<KeyParameter> attestParams)
+///  generates (ErrorCode, vec<vec<uint8_t>> certChain)`，
+/// 且 HAL 文档写明 attestParams **必须**含 `ATTESTATION_CHALLENGE`。
+///
+/// 所以留在 `generateKey` 里对认证没有任何用（它不产出证书），
+/// 只会多给 TEE 一次用 `UnsupportedTag` 拒掉整个调用的机会。
+///
+/// 归 `attestKey` 的是：挑战值、application id、全部 `ATTESTATION_ID_*`。
+/// 其余（含 `RESET_SINCE_ID_ROTATION`、`DEVICE_UNIQUE_ATTESTATION`、
+/// `INCLUDE_UNIQUE_ID`）留在 `generateKey` —— 它们是**密钥的**授权属性，要进
+/// KeyDescription 的 teeEnforced/softwareEnforced 列表，而那份列表来自密钥本身，
+/// 不来自 attestParams。
+pub fn split_km4_attestation(params: &[KeyParam]) -> (Vec<KeyParam>, Vec<KeyParam>) {
+    let mut key_params = Vec::with_capacity(params.len());
+    let mut attest_params = Vec::new();
+    for param in params.iter().cloned() {
+        if is_attestation_only(&param) {
+            attest_params.push(param);
+        } else {
+            key_params.push(param);
+        }
+    }
+    (key_params, attest_params)
+}
+
+/// 只对 `attestKey` 有意义的 tag。
+fn is_attestation_only(param: &KeyParam) -> bool {
+    matches!(
+        param,
+        KeyParam::AttestationChallenge(_)
+            | KeyParam::AttestationApplicationId(_)
+            | KeyParam::AttestationIdBrand(_)
+            | KeyParam::AttestationIdDevice(_)
+            | KeyParam::AttestationIdProduct(_)
+            | KeyParam::AttestationIdSerial(_)
+            | KeyParam::AttestationIdImei(_)
+            | KeyParam::AttestationIdSecondImei(_)
+            | KeyParam::AttestationIdMeid(_)
+            | KeyParam::AttestationIdManufacturer(_)
+            | KeyParam::AttestationIdModel(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmr_wire::keymint::{Algorithm, EcCurve, KeyPurpose};
+    use kmr_wire::keymint::{
+        Algorithm, BlockMode, Digest, EcCurve, KeyOrigin, KeyPurpose, PaddingMode, Tag,
+    };
     use kmr_wire::{KeySizeInBits, RsaExponent};
 
     /// tag 编号必须和 KM4 `types.hal` 的常量逐位相同，否则真 TEE 会回
@@ -178,5 +238,87 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].tag, 0x2000_0001);
         assert_eq!(out[1].tag, 0x1000_0002);
+    }
+
+    /// tag 内部的**枚举值**也必须和 KM4 `types.hal` 相同。这一层只搬 tag、不重编号值，
+    /// 所以任何一边改了编号，这里必须响。
+    ///
+    /// 右边这些数字是从 KM4 4.0 `types.hal` 抄下来的，不是「等于自己」的空转断言。
+    #[test]
+    fn enum_values_match_km4_types_hal() {
+        assert_eq!(KeyPurpose::Encrypt as i32, 0);
+        assert_eq!(KeyPurpose::Decrypt as i32, 1);
+        assert_eq!(KeyPurpose::Sign as i32, 2);
+        assert_eq!(KeyPurpose::Verify as i32, 3);
+        // 4 在 KM4 里是保留值，WRAP_KEY 就是 5。KeyMint 只是往后多接了 6/7。
+        assert_eq!(KeyPurpose::WrapKey as i32, 5);
+
+        assert_eq!(PaddingMode::None as i32, 1);
+        assert_eq!(PaddingMode::RsaOaep as i32, 2);
+        assert_eq!(PaddingMode::RsaPss as i32, 3);
+        assert_eq!(PaddingMode::RsaPkcs115Encrypt as i32, 4);
+        assert_eq!(PaddingMode::RsaPkcs115Sign as i32, 5);
+
+        assert_eq!(Digest::None as i32, 0);
+        assert_eq!(Digest::Md5 as i32, 1);
+        assert_eq!(Digest::Sha1 as i32, 2);
+        assert_eq!(Digest::Sha224 as i32, 3);
+        assert_eq!(Digest::Sha256 as i32, 4);
+        assert_eq!(Digest::Sha384 as i32, 5);
+        assert_eq!(Digest::Sha512 as i32, 6);
+
+        assert_eq!(Algorithm::Rsa as i32, 1);
+        assert_eq!(Algorithm::Ec as i32, 3);
+        assert_eq!(Algorithm::Aes as i32, 32);
+
+        assert_eq!(BlockMode::Ecb as i32, 1);
+        assert_eq!(BlockMode::Cbc as i32, 2);
+        assert_eq!(BlockMode::Ctr as i32, 3);
+        assert_eq!(BlockMode::Gcm as i32, 32);
+
+        assert_eq!(EcCurve::P224 as i32, 0);
+        assert_eq!(EcCurve::P256 as i32, 1);
+        assert_eq!(EcCurve::P384 as i32, 2);
+        assert_eq!(EcCurve::P521 as i32, 3);
+
+        assert_eq!(KeyOrigin::Generated as i32, 0);
+        assert_eq!(KeyOrigin::Imported as i32, 2);
+        assert_eq!(KeyOrigin::SecurelyImported as i32, 4);
+
+        assert_eq!(
+            kmr_wire::keymint::HardwareAuthenticatorType::Password as i32,
+            1
+        );
+        assert_eq!(
+            kmr_wire::keymint::HardwareAuthenticatorType::Fingerprint as i32,
+            2
+        );
+    }
+
+    /// 认证类参数必须和密钥参数分开：KM4 的 `generateKey` 拿不到 challenge，
+    /// 认证链只能另外走 `attestKey`。
+    #[test]
+    fn attestation_params_are_split_out() {
+        let input = vec![
+            KeyParam::Algorithm(Algorithm::Ec),
+            KeyParam::AttestationChallenge(vec![1, 2, 3, 4]),
+            KeyParam::AttestationApplicationId(vec![5, 6]),
+            KeyParam::AttestationIdBrand(b"brand".to_vec()),
+            KeyParam::Purpose(KeyPurpose::Sign),
+            // 看着像认证参数，其实是**密钥的**授权属性，必须留在 generateKey。
+            KeyParam::ResetSinceIdRotation,
+        ];
+        let (key, attest) = split_km4_attestation(&input);
+        assert_eq!(key.len(), 3);
+        assert_eq!(attest.len(), 3);
+
+        assert_eq!(key[0].tag(), Tag::Algorithm);
+        assert_eq!(key[1].tag(), Tag::Purpose);
+        assert_eq!(key[2].tag(), Tag::ResetSinceIdRotation);
+
+        // 拆出来的两桶各自保持原来的相对顺序。
+        assert_eq!(attest[0].tag(), Tag::AttestationChallenge);
+        assert_eq!(attest[1].tag(), Tag::AttestationApplicationId);
+        assert_eq!(attest[2].tag(), Tag::AttestationIdBrand);
     }
 }

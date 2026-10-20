@@ -11,8 +11,12 @@
 //!   * decrypt data
 //!
 //! Every operation is executed by the *real* on-device hardware keymint (TEE)
-//! through `get_system_keymint` + `begin`/`update`/`finish`, so the produced
+//! through `get_real_keymint` + `begin`/`update`/`finish`, so the produced
 //! signatures, decryptions and certificate chains are genuine TEE outputs.
+//!
+//! `get_real_keymint` picks the AIDL KeyMint HAL when the device has one and
+//! falls back to HIDL keymaster@4.x on parts that launched before Android 12
+//! (the Dimensity 1200, for instance), where AIDL KeyMint does not exist at all.
 //!
 //! Key blobs and certificate chains are held in a process-local hot cache keyed by
 //! alias and persisted in a SQLite file (`/data/adb/ommega/sessions.db`, see
@@ -53,13 +57,16 @@ fn after_date_time() -> DateTime {
     }
 }
 
-use crate::android::hardware::security::keymint::KeyParameter::KeyParameter as KmKeyParameter;
+use crate::android::hardware::security::keymint::IKeyMintDevice::IKeyMintDevice as AidlKeyMintDevice;
 use crate::android::hardware::security::keymint::KeyPurpose::KeyPurpose;
 use crate::err as ks_err;
+use crate::keymaster::hidl_km::HidlKeymaster;
+use crate::keymaster::km4_convert::{params_to_km4, split_km4_attestation};
 use crate::keymaster::relay_tee::{
-    clear_system_keymint, extract_km_error_code, get_system_keymint, key_params_to_aidl,
-    probe_keymint_version, KEY_MINT_V5,
+    clear_hidl_keymaster, clear_system_keymint, extract_km_error_code, get_real_keymint,
+    key_params_to_aidl, probe_keymint_version, RealKeymint, KEY_MINT_V5,
 };
+use rsbinder::Strong;
 
 use super::attest_proxy::{SYSTEM_KEYMINT_DEFAULT, SYSTEM_KEYMINT_STRONGBOX};
 use super::session_db;
@@ -545,34 +552,84 @@ fn mint_attest_key_on(
     app_id_der: &[u8],
     spec: &KeySpec,
 ) -> Result<TeeSession> {
-    let keymint = get_system_keymint(service)
+    let keymint = get_real_keymint(service)
         .with_context(|| ks_err!("real keymint {service} connect failed"))?;
-    // Probe the actual HAL version instead of assuming V5. A StrongBox HAL
-    // may only implement KeyMint V2/V3; sending V5-encoded parameters can
-    // cause version-mismatch errors that look like "not supported".
-    let km_version = probe_keymint_version(&keymint);
-    let params = build_attestation_params(app_id_der, challenge, spec, km_version)?;
+    let params = build_attestation_params(app_id_der, challenge, spec)?;
 
-    let result = match keymint.generateKey(&params, None) {
-        Ok(result) => result,
-        Err(status) => {
-            if is_dead_object_status(&status) {
-                clear_system_keymint(service);
+    let (key_blob, cert_chain) = match &keymint {
+        RealKeymint::Aidl(hal) => {
+            // Probe the actual HAL version instead of assuming V5. A StrongBox
+            // HAL may only implement KeyMint V2/V3; sending V5-encoded
+            // parameters can cause version-mismatch errors that look like
+            // "not supported".
+            let km_version = probe_keymint_version(hal);
+            let aidl_params = key_params_to_aidl(&params, km_version)
+                .with_context(|| ks_err!("encode real TEE attestation parameters"))?;
+
+            let result = match hal.generateKey(&aidl_params, None) {
+                Ok(result) => result,
+                Err(status) => {
+                    if is_dead_object_status(&status) {
+                        clear_system_keymint(service);
+                    }
+                    // Extract the KeyMint ErrorCode (e.g., -74, -68) so the caller
+                    // can distinguish "HAL not provisioned" from "parameter rejected".
+                    let km_code = km_error_suffix(&status);
+                    return Err(anyhow!(
+                        "real keymint {service} generateKey failed {km_code}: {status}"
+                    ));
+                }
+            };
+
+            let cert_chain: Vec<Vec<u8>> = result
+                .certificateChain
+                .into_iter()
+                .map(|cert| cert.encodedCertificate)
+                .collect();
+            (result.keyBlob, cert_chain)
+        }
+        RealKeymint::Hidl(hal) => {
+            // KM4 has no one-shot attested generateKey.  `generateKey` returns
+            // only (ErrorCode, keyBlob, KeyCharacteristics) — it has no
+            // attestKeyParams argument at all — and the chain comes from a
+            // second transaction, `attestKey(keyBlob, attestParams)`, whose
+            // attestParams must carry ATTESTATION_CHALLENGE.
+            let (key_params, attest_params) = split_km4_attestation(&params);
+            if !attest_params
+                .iter()
+                .any(|param| matches!(param, KeyParam::AttestationChallenge(_)))
+            {
+                return Err(anyhow!(
+                    "real keymint {service} ({}) got no attestation challenge; \
+                     KM4 cannot mint an attested key without one",
+                    hal.version().fq_name()
+                ));
             }
-            // Extract the KeyMint ErrorCode (e.g., -74, -68) so the caller
-            // can distinguish "HAL not provisioned" from "parameter rejected".
-            let km_code = km_error_suffix(&status);
-            return Err(anyhow!(
-                "real keymint {service} generateKey failed {km_code}: {status}"
-            ));
+
+            let generated = match hal.generate_key(&params_to_km4(&key_params)) {
+                Ok(generated) => generated,
+                Err(err) => {
+                    clear_hidl_keymaster();
+                    return Err(err.context(format!(
+                        "real keymint {service} ({}) generateKey failed",
+                        hal.version().fq_name()
+                    )));
+                }
+            };
+            let cert_chain =
+                match hal.attest_key(&generated.key_blob, &params_to_km4(&attest_params)) {
+                    Ok(chain) => chain,
+                    Err(err) => {
+                        clear_hidl_keymaster();
+                        return Err(err.context(format!(
+                            "real keymint {service} ({}) attestKey failed",
+                            hal.version().fq_name()
+                        )));
+                    }
+                };
+            (generated.key_blob, cert_chain)
         }
     };
-
-    let cert_chain: Vec<Vec<u8>> = result
-        .certificateChain
-        .into_iter()
-        .map(|cert| cert.encodedCertificate)
-        .collect();
 
     // A HAL that reports generateKey() *success* together with an empty
     // certificate chain must not be forwarded as a successful attestation:
@@ -583,14 +640,15 @@ fn mint_attest_key_on(
     // behaviour is unchanged.
     if cert_chain.is_empty() {
         return Err(anyhow!(
-            "real keymint {service} returned an empty certificate chain \
+            "real keymint {service} ({}) returned an empty certificate chain \
              (key_blob {}B) — generateKey was accepted but the key was not attested",
-            result.keyBlob.len()
+            keymint.backend(),
+            key_blob.len()
         ));
     }
 
     Ok(TeeSession {
-        key_blob: result.keyBlob,
+        key_blob,
         cert_chain,
         algorithm: spec.algorithm,
         hal_service: service,
@@ -601,8 +659,7 @@ fn build_attestation_params(
     app_id_der: &[u8],
     challenge: &[u8],
     spec: &KeySpec,
-    km_version: i32,
-) -> Result<Vec<KmKeyParameter>> {
+) -> Result<Vec<KeyParam>> {
     let (algo, default_size) = match spec.algorithm {
         KeyAlgorithm::EcP256 => (KmAlgorithm::Ec, 256u32),
         KeyAlgorithm::Rsa2048 => (KmAlgorithm::Rsa, 2048u32),
@@ -755,10 +812,11 @@ fn build_attestation_params(
     if let Some(serial) = &spec.cert_serial {
         params.push(KeyParam::CertificateSerial(serial.clone()));
     }
-    key_params_to_aidl(&params, km_version)
-        .with_context(|| ks_err!("encode real TEE attestation parameters"))
+    // 转成 HAL 参数这一步留给各后端：AIDL 要 `key_params_to_aidl`（还要按探测到的
+    // KeyMint 版本过滤），KM4 要 `params_to_km4` 而且得先拆成 generateKey /
+    // attestKey 两份。放在这里就只能挑一种，等于又把后端焊死。
+    Ok(params)
 }
-
 /// Rebuild the `KeyParam` variant for a `KM_TAG_ATTESTATION_ID_*` tag - the only
 /// tags the A-side forwards inside `device_attest_context.attestation_ids`.
 /// Anything else is rejected loudly instead of being silently dropped.
@@ -846,7 +904,7 @@ pub fn sign(alias: &str, data: &[u8], algorithm: &str) -> Result<Vec<u8>> {
     run_single_input_op(
         &session.key_blob,
         session.hal_service,
-        KeyPurpose::SIGN,
+        OpPurpose::Sign,
         &op_params,
         data,
     )
@@ -860,7 +918,7 @@ pub fn decrypt(alias: &str, data: &[u8], algorithm: &str) -> Result<Vec<u8>> {
     run_single_input_op(
         &session.key_blob,
         session.hal_service,
-        KeyPurpose::DECRYPT,
+        OpPurpose::Decrypt,
         &op_params,
         data,
     )
@@ -876,17 +934,74 @@ fn km_error_suffix(status: &rsbinder::Status) -> String {
         .unwrap_or_default()
 }
 
+/// The two single-input operations the relay performs.
+///
+/// Both backends need a purpose, but their enums are spelled differently:
+/// AIDL uses `KeyPurpose` (a `declare_binder_enum!` newtype, so it cannot be
+/// `match`ed or cast) while KM4 takes a plain `uint32_t`.  Keeping the two
+/// numberings side by side here is what stops them from drifting apart.
+///
+/// They happen to agree for these two — AIDL `SIGN` = 2 / `DECRYPT` = 1 and KM4
+/// `SIGN` = 2 / `DECRYPT` = 1 — but the enums are *not* generally the same: AIDL
+/// reserves 4 and continues with `AGREE_KEY`(6)/`ATTEST_KEY`(7), which KM4 4.x
+/// does not have at all.
+#[derive(Clone, Copy, Debug)]
+enum OpPurpose {
+    Sign,
+    Decrypt,
+}
+
+impl OpPurpose {
+    fn aidl(self) -> KeyPurpose {
+        match self {
+            OpPurpose::Sign => KeyPurpose::SIGN,
+            OpPurpose::Decrypt => KeyPurpose::DECRYPT,
+        }
+    }
+
+    /// KM4 `KeyPurpose` value: `SIGN` = 2, `DECRYPT` = 1.
+    fn km4(self) -> u32 {
+        match self {
+            OpPurpose::Sign => 2,
+            OpPurpose::Decrypt => 1,
+        }
+    }
+}
+
 fn run_single_input_op(
     key_blob: &[u8],
     hal_service: &'static str,
-    purpose: KeyPurpose,
-    op_params: &[KmKeyParameter],
+    purpose: OpPurpose,
+    op_params: &[KeyParam],
     input: &[u8],
 ) -> Result<Vec<u8>> {
-    let keymint = get_system_keymint(hal_service)
+    let keymint = get_real_keymint(hal_service)
         .with_context(|| ks_err!("real keymint {hal_service} connect failed"))?;
+    match &keymint {
+        RealKeymint::Aidl(hal) => {
+            run_aidl_single_input(hal, hal_service, purpose, key_blob, op_params, input)
+        }
+        RealKeymint::Hidl(hal) => {
+            run_hidl_single_input(hal, hal_service, purpose, key_blob, op_params, input)
+        }
+    }
+}
 
-    let begin = match keymint.begin(purpose, key_blob, op_params, None) {
+/// AIDL KeyMint 的 begin/update/finish。会话状态挂在返回的
+/// `IKeyMintOperation` binder 对象上。
+fn run_aidl_single_input(
+    keymint: &Strong<dyn AidlKeyMintDevice>,
+    hal_service: &'static str,
+    purpose: OpPurpose,
+    key_blob: &[u8],
+    op_params: &[KeyParam],
+    input: &[u8],
+) -> Result<Vec<u8>> {
+    // 沿用 KEY_MINT_V5 编码 begin 参数，和加双后端之前的行为一致。
+    let aidl_params = key_params_to_aidl(op_params, KEY_MINT_V5)
+        .with_context(|| ks_err!("encode real TEE operation parameters"))?;
+
+    let begin = match keymint.begin(purpose.aidl(), key_blob, &aidl_params, None) {
         Ok(result) => result,
         Err(status) => {
             if is_dead_object_status(&status) {
@@ -929,11 +1044,64 @@ fn run_single_input_op(
     result
 }
 
+/// HIDL KM4 的 begin/update/finish。
+///
+/// 和 AIDL 最大的差别：KM4 的操作是 **u64 句柄**而不是 binder 对象，状态留在设备
+/// 侧，我们只把句柄传回去。
+fn run_hidl_single_input(
+    keymint: &HidlKeymaster,
+    hal_service: &'static str,
+    purpose: OpPurpose,
+    key_blob: &[u8],
+    op_params: &[KeyParam],
+    input: &[u8],
+) -> Result<Vec<u8>> {
+    let fq_name = keymint.version().fq_name();
+    let in_params = params_to_km4(op_params);
+
+    let begin = match keymint.begin(purpose.km4(), key_blob, &in_params) {
+        Ok(begin) => begin,
+        Err(err) => {
+            // 重连一次的代价只是 open + 一次 getService，比拿着已经死掉的
+            // hwbinder 句柄一路失败要好。
+            clear_hidl_keymaster();
+            return Err(err.context(format!(
+                "real keymint {hal_service} ({fq_name}) begin failed"
+            )));
+        }
+    };
+    let handle = begin.operation_handle;
+
+    let result = (|| -> Result<Vec<u8>> {
+        let (consumed, _, mut out) = keymint.update(handle, &[], input).map_err(|err| {
+            err.context(format!(
+                "real keymint {hal_service} ({fq_name}) update failed"
+            ))
+        })?;
+        // KM4 的 update 允许只消费一部分输入，剩下的按 HAL 契约交给 finish。
+        // 直接假设「一次吃完」会在输入被截断时静默丢数据。
+        let rest = &input[(consumed as usize).min(input.len())..];
+        let (_, tail) = keymint.finish(handle, &[], rest, &[]).map_err(|err| {
+            err.context(format!(
+                "real keymint {hal_service} ({fq_name}) finish failed"
+            ))
+        })?;
+        out.extend_from_slice(&tail);
+        Ok(out)
+    })();
+
+    if result.is_err() {
+        let _ = keymint.abort(handle);
+        clear_hidl_keymaster();
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Begin-parameter builders.
 // ---------------------------------------------------------------------------
 
-fn sign_begin_params(algorithm: &str, key_algorithm: KeyAlgorithm) -> Result<Vec<KmKeyParameter>> {
+fn sign_begin_params(algorithm: &str, key_algorithm: KeyAlgorithm) -> Result<Vec<KeyParam>> {
     let digest = digest_for_algorithm(algorithm)?;
     let params = match key_algorithm {
         KeyAlgorithm::EcP256 => vec![KeyParam::Digest(digest)],
@@ -962,14 +1130,11 @@ fn sign_begin_params(algorithm: &str, key_algorithm: KeyAlgorithm) -> Result<Vec
             p
         }
     };
-    key_params_to_aidl(&params, KEY_MINT_V5)
-        .with_context(|| ks_err!("encode sign begin parameters"))
+    // 转成 HAL 参数留给各后端：AIDL 走 `key_params_to_aidl`，KM4 走 `params_to_km4`。
+    Ok(params)
 }
 
-fn decrypt_begin_params(
-    algorithm: &str,
-    key_algorithm: KeyAlgorithm,
-) -> Result<Vec<KmKeyParameter>> {
+fn decrypt_begin_params(algorithm: &str, key_algorithm: KeyAlgorithm) -> Result<Vec<KeyParam>> {
     let params = match key_algorithm {
         KeyAlgorithm::EcP256 => {
             return Err(anyhow!("EC keys cannot be used for decrypt"));
@@ -997,8 +1162,8 @@ fn decrypt_begin_params(
             }
         }
     };
-    key_params_to_aidl(&params, KEY_MINT_V5)
-        .with_context(|| ks_err!("encode decrypt begin parameters"))
+    // 同上：HAL 参数由后端各自转。
+    Ok(params)
 }
 
 /// Parses the MGF1 digest from an OAEP algorithm string like
@@ -1198,22 +1363,20 @@ mod alias_flight_tests {
 #[cfg(test)]
 mod algorithm_digest_tests {
     use super::*;
-    use crate::android::hardware::security::keymint::{
-        Digest::Digest, KeyParameterValue::KeyParameterValue, PaddingMode::PaddingMode, Tag::Tag,
-    };
+    use kmr_wire::keymint::Tag as KmTag;
 
-    fn digest_param(tag: Tag, digest: KmDigest) -> KmKeyParameter {
-        KmKeyParameter {
-            tag,
-            value: KeyParameterValue::Digest(Digest(digest as i32)),
+    // `begin` 参数现在是 wire 形式（`KeyParam`），HAL 编码由各后端自己做，
+    // 所以断言也直接盯着 wire 参数 —— 比盯着 AIDL 结构体更接近真正发出去的东西。
+    fn digest_param(tag: KmTag, digest: KmDigest) -> KeyParam {
+        match tag {
+            KmTag::Digest => KeyParam::Digest(digest),
+            KmTag::RsaOaepMgfDigest => KeyParam::RsaOaepMgfDigest(digest),
+            other => panic!("unexpected digest tag {other:?}"),
         }
     }
 
-    fn padding_param(padding: KmPadding) -> KmKeyParameter {
-        KmKeyParameter {
-            tag: Tag::PADDING,
-            value: KeyParameterValue::PaddingMode(PaddingMode(padding as i32)),
-        }
+    fn padding_param(padding: KmPadding) -> KeyParam {
+        KeyParam::Padding(padding)
     }
 
     #[test]
@@ -1247,9 +1410,9 @@ mod algorithm_digest_tests {
                 KmPadding::RsaPss,
             ),
         ] {
-            let mut expected = vec![digest_param(Tag::DIGEST, digest), padding_param(padding)];
+            let mut expected = vec![digest_param(KmTag::Digest, digest), padding_param(padding)];
             if padding == KmPadding::RsaPss {
-                expected.push(digest_param(Tag::RSA_OAEP_MGF_DIGEST, digest));
+                expected.push(digest_param(KmTag::RsaOaepMgfDigest, digest));
             }
             assert_eq!(
                 sign_begin_params(algorithm, KeyAlgorithm::Rsa2048).unwrap(),
@@ -1260,7 +1423,7 @@ mod algorithm_digest_tests {
         assert!(sign_begin_params("SHA256withRSA/UNKNOWN", KeyAlgorithm::Rsa2048).is_err());
         assert_eq!(
             sign_begin_params("SHA224withECDSA", KeyAlgorithm::EcP256).unwrap(),
-            vec![digest_param(Tag::DIGEST, KmDigest::Sha224)]
+            vec![digest_param(KmTag::Digest, KmDigest::Sha224)]
         );
     }
 
@@ -1270,8 +1433,8 @@ mod algorithm_digest_tests {
             decrypt_begin_params("RSA/OAEP/SHA-384/MGF1-SHA224", KeyAlgorithm::Rsa2048).unwrap(),
             vec![
                 padding_param(KmPadding::RsaOaep),
-                digest_param(Tag::DIGEST, KmDigest::Sha384),
-                digest_param(Tag::RSA_OAEP_MGF_DIGEST, KmDigest::Sha224),
+                digest_param(KmTag::Digest, KmDigest::Sha384),
+                digest_param(KmTag::RsaOaepMgfDigest, KmDigest::Sha224),
             ]
         );
         for algorithm in [
