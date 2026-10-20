@@ -8,11 +8,17 @@
 #
 # clippy 带 -D warnings：三端的警告已经清干净了，带上才拦得住回潮。
 # 本地那道 pre-commit 钩子只查格式（脚本在仓库根的 .cargo-husky/hooks/）。
+#
+# 除了门禁，最后那条 `package` job 负责出 B 端的模块包（刷入用的 zip）：
+# push 到 master 出 artifact，打 `v*` tag 时再顺手发 Release。
 name: ci
 
 on:
   push:
     branches: [master]
+    # 打 tag 也要触发：`branches` 过滤器只认分支，光写 master 的话 tag push
+    # 一次都不会跑，package 里那段发 Release 的步骤就永远轮不到。
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -143,3 +149,118 @@ jobs:
           else
             cargo test --workspace
           fi
+
+  # B 端模块包（Magisk/KernelSU 刷入用的 zip）。
+  #
+  # 为什么不写 `needs: gate`：gate 矩阵里 a-side（clippy）和 server（测试）在上游
+  # 就是红的，挂上去等于永远轮不到出包。b-side 自己的门禁在 gate 里已经单独跑了，
+  # 而且这里出包之前要再编一遍 release，编不过照样红 —— 兜底没丢。
+  #
+  # pull_request 不跑：出包是给装机用的，PR 上白编一遍 release 没意义。
+  package:
+    name: package (b-side 模块包)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      # 打 tag 那一步要发 Release，只有这条 job 需要写权限。
+      contents: write
+    env:
+      ANDROID_NDK_ROOT: /home/runner/android-ndk-r27d
+    steps:
+      - uses: actions/checkout@v4
+
+      # 只用 stable：AGENTS.md 里「必须 nightly（OnceCell::get_or_try_init）」
+      # 那句已经过时了，那个调用全仓搜不到，stable 编得过。
+      - name: 装工具链
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add aarch64-linux-android
+
+      # 和 gate 共用同一把缓存 key：两条腿谁先跑谁把 NDK 存进去，另一条直接命中。
+      - name: 取 NDK 缓存
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/android-ndk-r27d
+          key: android-ndk-r27d-linux
+
+      - name: 下 NDK r27d
+        if: steps.ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 --max-time 900 -o /tmp/ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q /tmp/ndk.zip -d /home/runner
+          rm -f /tmp/ndk.zip
+          test -x "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+
+      - name: 生成 .cargo/config.toml
+        working-directory: b-side/source
+        run: python3 scripts/setup_cargo_config.py
+
+      - name: 取 cargo 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            b-side/source/target
+          key: cargo-${{ runner.os }}-package-${{ hashFiles('b-side/source/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-package-
+
+      - name: 打包
+        working-directory: b-side/source
+        run: python3 build.py --release --abi arm64-v8a
+
+      # 包出来了不等于里面的东西对：直接盯 release 二进制里的 HAL 名，确认
+      # HIDL 后端真的编进去了（没有 AIDL KeyMint 的机器全靠它）。
+      - name: 校验包内容
+        working-directory: b-side/source
+        run: |
+          set -euo pipefail
+          relay=target/aarch64-linux-android/release/relay
+          for needle in \
+            'android.hardware.keymaster@4.1::IKeymasterDevice' \
+            'android.hardware.keymaster@4.0::IKeymasterDevice'
+          do
+            grep -qa "$needle" "$relay" || {
+              echo "::error::relay 里找不到 $needle —— HIDL 后端没进包"
+              exit 1
+            }
+            echo "OK  $needle"
+          done
+
+          zip=$(ls target/ommega-b-release-*.zip)
+          unzip -l "$zip"
+          {
+            echo "### B 端模块包"
+            echo
+            echo '```'
+            sha256sum "$zip"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ommega-b-module
+          path: b-side/source/target/ommega-b-release-*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 打 tag 时发 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: b-side/source
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046  # 通配符要展开成多个附件参数
+          gh release create "$GITHUB_REF_NAME" \
+            $(ls target/ommega-b-release-*.zip) \
+            --title "ommega-b $GITHUB_REF_NAME" \
+            --notes "B 端模块包（arm64-v8a，release 构建）。刷入方式见 README。" \
+            --verify-tag
