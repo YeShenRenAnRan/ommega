@@ -308,6 +308,19 @@ impl Parcel {
         self.lash(vec![0u8; n])
     }
 
+    /// 把调用方自己拼好的一段字节挂上去，返回稳定地址。
+    ///
+    /// `hidl_string` / `vec<uint8_t>` 这两个只需要「指针 + 长度」，本模块内部就能闭环。
+    /// 但结构体数组（`vec<KeyParameter>` 那种 32 字节一个的）得先在本地拼好，其中
+    /// 内嵌的 `vec` 头又要回填**别人的**地址 —— 那个地址只能由 `lash` 给，所以把
+    /// 「挂上去并还我地址」这一步开出来。
+    ///
+    /// 回填是「先挂、后拼」的：调用方先 `lash_bytes` 拿到所有内层数据的地址，再拼
+    /// 外层结构体，最后 `lash_bytes` 外层。地址在 `Parcel` 活着的整个期间都有效。
+    pub fn lash_bytes(&mut self, bytes: &[u8]) -> usize {
+        self.lash(bytes.to_vec())
+    }
+
     /// 查上一块挂上去的字节的可写地址。
     ///
     /// 返回 `*mut u8` 是故意的：`hidl_string` 的结构体里要回填一个指向字符区的指针，
