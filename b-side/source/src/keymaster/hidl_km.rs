@@ -1130,6 +1130,32 @@ impl<'a> ReplyReader<'a> {
         Ok(())
     }
 
+    /// 诊断用：把游标后面的对象按线格式逐条打出来，游标原样恢复。
+    ///
+    /// 回包对不上时用它把真实的对象序列钉死 —— 猜一次不如打一遍。
+    fn dump_objects(&mut self) -> String {
+        let saved = self.at;
+        // 从 status/errorCode 两个标量之后开始，也就是第一个对象。
+        self.at = 8;
+        let mut out = String::new();
+        for idx in 0..64 {
+            let Ok(ty) = self.u32() else { break };
+            let Ok(flags) = self.u32() else { break };
+            let Ok(buffer) = self.abi_usize() else { break };
+            let Ok(length) = self.abi_usize() else { break };
+            let Ok(parent) = self.abi_usize() else { break };
+            let Ok(parent_offset) = self.abi_usize() else {
+                break;
+            };
+            out.push_str(&format!(
+                "\n     [{idx}] ty={ty} flags={flags:#x} buf={buffer:#x} len={length} \
+                 parent={parent:#x} poff={parent_offset}"
+            ));
+        }
+        self.at = saved;
+        out
+    }
+
     /// 一个 `binder_buffer_object`，只取 `(type, buffer, length)`。
     fn buffer_object(&mut self) -> Result<(u32, usize, usize)> {
         let ty = self.u32()?;
@@ -1153,7 +1179,12 @@ impl<'a> ReplyReader<'a> {
     fn embedded_head(&mut self) -> Result<(usize, usize, usize)> {
         let (_ty, head_addr, head_len) = self.buffer_object()?;
         if head_len != HIDL_STRUCT_SIZE {
-            bail!("hidl_vec header object claims {head_len} bytes, expected {HIDL_STRUCT_SIZE}");
+            let dump = self.dump_objects();
+            bail!(
+                "hidl_vec header object claims {head_len} bytes, expected {HIDL_STRUCT_SIZE} \
+                 (cursor at {}){dump}",
+                self.at
+            );
         }
         let (_ty, elems_addr, elems_len) = self.buffer_object()?;
 
@@ -1233,7 +1264,12 @@ impl<'a> ReplyReader<'a> {
     /// `vec<KeyParameter>`。每个元素 32 字节；带非空 blob 的元素后面还跟着一个
     /// 数据对象，按元素顺序消费。
     fn key_params(&mut self) -> Result<Vec<KmParam>> {
-        let (elems_addr, head_size, bytes_len) = self.embedded_head()?;
+        // 嵌在 `KeyCharacteristics` 里的 `vec<KeyParameter>` **没有独立的头对象**：
+        // 那个 16 字节的头（指针 + 元素个数）就躺在结构体自己的 32 字节里，元素区
+        // 直接以 `parent_offset = 字段偏移`（softwareEnforced 是 0、hardwareEnforced
+        // 是 16）挂上来。所以这里读到的第一个对象就是元素区本身，元素个数用字节数
+        // 除以 32 就是。
+        let (_ty, elems_addr, bytes_len) = self.buffer_object()?;
         if bytes_len == 0 {
             return Ok(Vec::new());
         }
@@ -1243,16 +1279,7 @@ impl<'a> ReplyReader<'a> {
                  not a multiple of {KM_PARAM_SIZE}"
             );
         }
-        // 元素个数以元素区对象的字节数为权威。头里那一格对端可能写元素个数、也可能
-        // 写字节数（1 字节元素的类型上这两种写法无法区分，所以两种实现都见过），
-        // 这里只拿它做一致性校验。
         let count = bytes_len / KM_PARAM_SIZE;
-        if head_size != count && head_size != bytes_len {
-            bail!(
-                "vec<KeyParameter> header says {head_size}, but the element object is \
-                 {bytes_len} bytes ({count} elements)"
-            );
-        }
         let bytes = self
             .conn
             .read_mapped(elems_addr, bytes_len)
