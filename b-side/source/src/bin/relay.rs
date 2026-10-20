@@ -69,13 +69,13 @@ use ommegaclient_b::wakelock;
 /// 控制。之前用长轮询（15s→5s→1s）时，任务落在两轮之间就要等满一个周期，实测
 /// 端到端多出 1 秒以上的固定延迟；改成 120ms 短轮询后，最坏等 120ms。
 /// 短轮询的空响应只有几字节，服务端压力可以忽略。
-const POLL_TIMEOUT_SEC: u32 = 0;
+const POLL_TIMEOUT_SEC: u32 = 20;
 const CONNECT_TIMEOUT_MS: u64 = 3000;
 const READ_TIMEOUT_MS: u64 = 30_000;
 /// 一轮 poll 最多允许的墙钟时间。刻意比上面的 READ_TIMEOUT_MS 早一步收网：那个
 /// 30s 是 reqwest 自己的总超时，用单调钟算，设备 suspend 之后就不作数了。
 /// 短轮询下给 3s（一次往返 + 余量）。
-const POLL_WALL_LIMIT: Duration = Duration::from_secs(3);
+const POLL_WALL_LIMIT: Duration = Duration::from_secs(25);
 /// 处理一个任务的上限。任务里有真 TEE 调用、还有带重试的结果回传（最坏 4×33s
 /// 再加退避），所以给得宽一点，这一条只用来兜「整个循环不再往前转」。
 const TASK_WALL_LIMIT: Duration = Duration::from_secs(180);
@@ -683,7 +683,14 @@ fn poll_tasks(cfg: &RelayConfig) -> Result<Option<(String, String, Value)>> {
     let headers = vec![("X-Relay-Token".to_string(), cfg.token.clone())];
     let (status, body) =
         http_request(cfg, "GET", &url, &headers, None).with_context(|| "b/poll failed")?;
-    log::info!("b/poll status={status} body_len={}", body.len());
+    // 204 = 没有任务。长轮询下这是绝大多数情况，每秒几十轮都打 INFO 会把
+    // relay.log 灌到几百 MB/天（默认级别还是 debug，连 reqwest 的建连日志一起算
+    // 更夸张）。空闲降到 trace，只有真派了任务或出错才留 INFO。
+    if status == 204 {
+        log::trace!("b/poll 204");
+    } else {
+        log::info!("b/poll status={status} body_len={}", body.len());
+    }
     match status {
         204 => Ok(None),
         200 => {
@@ -1258,7 +1265,7 @@ fn worker_loop(shared: Arc<RwLock<RelayConfig>>) {
     // 直接把服务器打满。失败路径同理，用指数退避兜住。
     // 短轮询：服务端立即返回，两轮之间的间隔就是最坏延迟。实测下来的结论：80ms
     // （每秒 12 次）是速度与稳定性的拐点 —— 再快收益很小，空转请求却线性上涨。
-    const MIN_POLL_INTERVAL: Duration = Duration::from_millis(80);
+    const MIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
     const MAX_ERROR_BACKOFF: Duration = Duration::from_secs(30);
     // 长轮询卡死之后没人管，是线上那几次几小时静默 gap 的成因：请求停在 reqwest
     // 的 read 上，那一路超时都用单调钟算，设备 suspend 之后永远不到 —— 进程活着，

@@ -900,7 +900,10 @@ fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
         let field_off = i * KM_PARAM_SIZE + KM_PARAM_BLOB_OFF;
         match &p.value {
             KmValue::Blob(b) if !b.is_empty() => {
-                let addr = blob_addrs[i].expect("non-empty blob was lashed");
+                // 非空 blob 一定有地址（`lash` 的返回值）。真出现 None 只能是本
+                // 编码器自己矛盾：退回空子对象，让 HAL 走参数错误，而不是 panic
+                // 掉整条守护进程 —— 这个函数不返回 Result，没别的上报路径。
+                let addr = blob_addrs[i].unwrap_or(0);
                 parcel.write_buffer_object(
                     addr,
                     b.len(),

@@ -289,7 +289,10 @@ impl Parcel {
             }
             let mut raw = [0u8; 8];
             raw.copy_from_slice(&self.data[at + 16..at + 24]);
-            total += (u64::from_le_bytes(raw) as usize + 7) & !7usize;
+            // saturating：长度字段来自我们自己的对象表，正常永远不可能接近 usize::MAX；
+            // 真到了那一步说明编码器自己写错了，这里宁可饱和到上限让后续 mmap/ioctl
+            // 明确失败，也不要回绕成一个"看起来合法"的小偏移。
+            total = total.saturating_add((u64::from_le_bytes(raw) as usize + 7) & !7usize);
         }
         total
     }
