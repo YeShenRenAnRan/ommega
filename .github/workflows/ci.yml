@@ -32,6 +32,10 @@ concurrency:
 jobs:
   gate:
     runs-on: ubuntu-24.04
+    # tag push 不用再把门禁重跑一遍：tag 指向的提交在它那次分支 push 里已经过过。
+    # 不挡的话，打 tag 出包那次 run 会因为 a-side/server 两条上游红腿整体变红，
+    # 而出包本身其实是绿的 —— 信号被淹掉。
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     strategy:
       fail-fast: false
       matrix:
