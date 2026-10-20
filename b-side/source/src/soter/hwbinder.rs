@@ -375,10 +375,12 @@ impl Parcel {
 
     /// 一个 HIDL 的 `vec<uint8_t>`。
     ///
-    /// 布局跟 `hidl_string` 一模一样（指向 16 字节的 `hidl_vec` 头 + 指向元素），
-    /// 区别只在长度是元素个数、且不带 NUL。空 vector 走 `readNullableEmbeddedBuffer`
-    /// 那一套：元素指针和长度都给 0，而且内核不登记 buffer 为 0 的对象，所以两个对象
-    /// 只登记前一个。
+    /// 布局跟 `hidl_string` 一模一样（指向 16 字节的 `hidl_vec` 头 + 指向元素）。
+    /// 头里那一格是**元素区字节数** —— 对 1 字节元素来说正好等于元素个数，所以
+    /// 这两种写法在 `vec<uint8_t>` 上无法区分；换 32 字节的元素就必须写字节数。
+    ///
+    /// 空 vector 也照样要挂两个对象：元素指针和长度给 0，但那个 buffer=0 的对象
+    /// 必须进偏移表，否则接收端按偏移表走时会认为元素区对象缺失而回 `BAD_VALUE`。
     pub fn write_hidl_vec_u8(&mut self, value: &[u8]) {
         let (elem_addr, elem_len) = if value.is_empty() {
             (0usize, 0usize)
@@ -398,21 +400,16 @@ impl Parcel {
             );
         }
 
-        if value.is_empty() {
-            self.write_buffer_object(head_addr, HIDL_STRUCT_SIZE, 0, 0, 0, true);
-            self.write_buffer_object(0, 0, 0, 0, 0, false);
-        } else {
-            let parent_handle = self.offsets.len() as BinderSize;
-            self.write_buffer_object(head_addr, HIDL_STRUCT_SIZE, 0, 0, 0, true);
-            self.write_buffer_object(
-                elem_addr,
-                elem_len,
-                BINDER_BUFFER_FLAG_HAS_PARENT,
-                parent_handle as usize,
-                0,
-                true,
-            );
-        }
+        let parent_handle = self.offsets.len() as BinderSize;
+        self.write_buffer_object(head_addr, HIDL_STRUCT_SIZE, 0, 0, 0, true);
+        self.write_buffer_object(
+            elem_addr,
+            elem_len,
+            BINDER_BUFFER_FLAG_HAS_PARENT,
+            parent_handle as usize,
+            0,
+            true,
+        );
     }
 
     /// 往 data 里写一个 `binder_buffer_object` 并把它的下标记进偏移表。

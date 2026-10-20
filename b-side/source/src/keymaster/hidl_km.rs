@@ -342,9 +342,12 @@ pub struct KmBeginResult {
 
 /// `sizeof(KeyParameter)`。
 pub const KM_PARAM_SIZE: usize = 32;
-/// `offsetof(KeyParameter, f)`：8 字节联合体。
+/// `offsetof(KeyParameter, value.<标量成员>)`。
+///
+/// `KeyParameterValue` 在 `types.hal` 里被 AOSP 摊平过，**线上没有联合体判别符**
+/// （`Tag` 自己就是判别符），所以标量那一格和 `blob` 头不重合。
 const KM_PARAM_F_OFF: usize = 8;
-/// `offsetof(KeyParameter, blob)`：16 字节的 `hidl_vec` 头。
+/// `offsetof(KeyParameter, value.blob)`：16 字节的 `hidl_vec` 头。
 const KM_PARAM_BLOB_OFF: usize = 16;
 
 /// `sizeof(KeyCharacteristics)`：两个 16 字节头挨着。
@@ -816,17 +819,21 @@ fn accepted_version(
 /// parcel 里的对象顺序（接收端就是按这个顺序往下消费的）：
 ///
 /// ```text
-///   0: 16 字节的 hidl_vec 头        (指向 1，元素个数 = N)
+///   0: 16 字节的 hidl_vec 头        (指向 1，长度 = 元素个数)
 ///   1: N * 32 字节的元素数组        (HAS_PARENT -> 0，parent_offset 0)
-///   2..: 每个非空 blob 的数据块      (HAS_PARENT -> 1，parent_offset = 元素偏移 + 16)
+///   2..: 每个元素一个子对象          (HAS_PARENT -> 1，parent_offset = 元素偏移 + 16)
 /// ```
+///
+/// 第 2 组是**每个元素都有**，不是只有 blob 参数才有 —— 见下面那段注释。
 fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
     if params.is_empty() {
         // 空 vector：头对象照写（元素指针和长度都是 0），再补一个 buffer=0 的哑对象。
-        // 哑对象内核不登记，接收端看到指针为 0 就当空 vector。
+        // 哑对象也必须进偏移表 —— 接收端是按偏移表逐个对象往下走的，少了这一格它
+        // 会认为「该有的元素区对象不存在」而回 BAD_VALUE，而不是当成空 vector。
         let head_addr = parcel.lash_bytes(&[0u8; HIDL_STRUCT_SIZE]);
+        let head_idx = parcel.offsets().len();
         parcel.write_buffer_object(head_addr, HIDL_STRUCT_SIZE, 0, 0, 0, true);
-        parcel.write_buffer_object(0, 0, 0, 0, 0, false);
+        parcel.write_buffer_object(0, 0, BINDER_BUFFER_FLAG_HAS_PARENT, head_idx, 0, true);
         return;
     }
 
@@ -848,7 +855,7 @@ fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
         match &p.value {
             KmValue::None => {
                 // `TagType:BOOL` 的语义是「tag 存在即为真」，但真 TEE 里有的实现会
-                // 顺手去读 `f.boolValue`。把那一格写成 1，两种读法都成立。
+                // 顺手去读 `boolValue`。把那一格写成 1，两种读法都成立。
                 if tag_type(p.tag) == Some(TT_BOOL) {
                     elems[o + KM_PARAM_F_OFF] = 1;
                 }
@@ -873,6 +880,7 @@ fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
     let elems_addr = parcel.lash_bytes(&elems);
     let mut head = [0u8; HIDL_STRUCT_SIZE];
     head[0..8].copy_from_slice(&(elems_addr as u64).to_le_bytes());
+    // 头里那一格是**元素个数**。
     head[8..12].copy_from_slice(&(params.len() as u32).to_le_bytes());
     let head_addr = parcel.lash_bytes(&head);
 
@@ -902,18 +910,21 @@ fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
                     true,
                 );
             }
-            KmValue::Blob(_) => {
-                // 空 blob：哑对象，带 HAS_PARENT 但不登记。
+            _ => {
+                // 标量参数和空 blob 也必须挂一个空子对象。HIDL 的读取端对
+                // `KeyParameterValue` 里那个 `vec<uint8_t> blob` 成员是无条件读的，
+                // 判别式不参与决定「要不要读」。少一个子对象，读序列就错位，
+                // 服务端 `onTransact` 直接回 BAD_VALUE(-22) —— 这一点是在真机上
+                // 一个元素一个元素试出来的，不是推出来的。
                 parcel.write_buffer_object(
                     0,
                     0,
                     BINDER_BUFFER_FLAG_HAS_PARENT,
                     elems_idx,
                     field_off,
-                    false,
+                    true,
                 );
             }
-            _ => {}
         }
     }
 }
@@ -1222,15 +1233,24 @@ impl<'a> ReplyReader<'a> {
     /// `vec<KeyParameter>`。每个元素 32 字节；带非空 blob 的元素后面还跟着一个
     /// 数据对象，按元素顺序消费。
     fn key_params(&mut self) -> Result<Vec<KmParam>> {
-        let (elems_addr, count, bytes_len) = self.embedded_head()?;
-        if count == 0 {
+        let (elems_addr, head_size, bytes_len) = self.embedded_head()?;
+        if bytes_len == 0 {
             return Ok(Vec::new());
         }
-        if bytes_len != count * KM_PARAM_SIZE {
+        if bytes_len % KM_PARAM_SIZE != 0 {
             bail!(
-                "vec<KeyParameter> header says {count} elements, so the element object should be \
-                 {} bytes, but it is {bytes_len}",
-                count * KM_PARAM_SIZE
+                "vec<KeyParameter> element object is {bytes_len} bytes, \
+                 not a multiple of {KM_PARAM_SIZE}"
+            );
+        }
+        // 元素个数以元素区对象的字节数为权威。头里那一格对端可能写元素个数、也可能
+        // 写字节数（1 字节元素的类型上这两种写法无法区分，所以两种实现都见过），
+        // 这里只拿它做一致性校验。
+        let count = bytes_len / KM_PARAM_SIZE;
+        if head_size != count && head_size != bytes_len {
+            bail!(
+                "vec<KeyParameter> header says {head_size}, but the element object is \
+                 {bytes_len} bytes ({count} elements)"
             );
         }
         let bytes = self
@@ -1243,8 +1263,10 @@ impl<'a> ReplyReader<'a> {
         // 前面已经校验过字节数是 32 的整数倍，所以余数那一截一定是空的。
         for (i, chunk) in bytes.as_chunks::<KM_PARAM_SIZE>().0.iter().enumerate() {
             let tag = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            // 线上没有联合体判别符，`Tag` 自己就说明了这一格是什么类型。
+            let is_blob = tag_type(tag) == Some(TT_BYTES);
 
-            // blob 头里的 (指针, 长度)。长度非 0 就说明后面挂着一个数据对象。
+            // blob 头里的 (指针, 长度)。
             let mut ptr_raw = [0u8; 8];
             ptr_raw.copy_from_slice(&chunk[KM_PARAM_BLOB_OFF..KM_PARAM_BLOB_OFF + 8]);
             let blob_ptr = u64::from_le_bytes(ptr_raw) as usize;
@@ -1252,22 +1274,29 @@ impl<'a> ReplyReader<'a> {
             size_raw.copy_from_slice(&chunk[KM_PARAM_BLOB_OFF + 8..KM_PARAM_BLOB_OFF + 12]);
             let blob_len = u32::from_le_bytes(size_raw) as usize;
 
-            let value = if blob_len != 0 {
-                let (_ty, data_addr, data_len) = self.buffer_object()?;
-                if data_addr != blob_ptr {
-                    bail!(
-                        "KeyParameter[{i}] blob header points at {blob_ptr:#x} \
-                         but the object says {data_addr:#x}"
-                    );
+            // 每个元素都对应一个子对象 —— 标量参数的也是空的。这一点是量出来的：
+            // 少一个子对象，对端读参数时整条序列就会错位并回 BAD_VALUE。
+            let (_ty, data_addr, data_len) = self.buffer_object()?;
+
+            let value = if is_blob {
+                if data_len == 0 {
+                    KmValue::Blob(Vec::new())
+                } else {
+                    if data_addr != blob_ptr {
+                        bail!(
+                            "KeyParameter[{i}] blob header points at {blob_ptr:#x} \
+                             but the object says {data_addr:#x}"
+                        );
+                    }
+                    if data_len != blob_len {
+                        bail!("KeyParameter[{i}] blob header says {blob_len} bytes but the object says {data_len}");
+                    }
+                    KmValue::Blob(
+                        self.conn
+                            .read_mapped(data_addr, data_len)
+                            .context("KeyParameter blob is outside our binder mapping")?,
+                    )
                 }
-                if data_len != blob_len {
-                    bail!("KeyParameter[{i}] blob header says {blob_len} bytes but the object says {data_len}");
-                }
-                KmValue::Blob(
-                    self.conn
-                        .read_mapped(data_addr, data_len)
-                        .context("KeyParameter blob is outside our binder mapping")?,
-                )
             } else {
                 let word = u32::from_le_bytes([
                     chunk[KM_PARAM_F_OFF],
@@ -1276,18 +1305,17 @@ impl<'a> ReplyReader<'a> {
                     chunk[KM_PARAM_F_OFF + 3],
                 ]);
                 match tag_type(tag) {
-                    Some(t) if t == TT_BYTES => KmValue::Blob(Vec::new()),
                     Some(t) if t == TT_DATE => {
                         KmValue::DateTime(read_u64_at(chunk, KM_PARAM_F_OFF))
                     }
                     Some(t) if t == TT_ULONG || t == TT_ULONG_REP => {
                         KmValue::LongInteger(read_u64_at(chunk, KM_PARAM_F_OFF))
                     }
-                    // ENUM / ENUM_REP / UINT 在联合体里都是那一格 u32。
+                    // ENUM / ENUM_REP / UINT 都是那一格 u32。
                     Some(t) if t == TT_ENUM || t == TT_ENUM_REP || t == TT_UINT => {
                         KmValue::Integer(word)
                     }
-                    // BOOL 靠 tag 存在与否表达，联合体里没有额外信息。
+                    // BOOL 靠 tag 存在与否表达，那一格里没有额外信息。
                     _ => KmValue::None,
                 }
             };
@@ -1573,7 +1601,8 @@ mod tests {
 
     #[test]
     fn struct_layout_is_c_abi() {
-        // KeyParameter: tag(4) + pad(4) + union(8) + hidl_vec head(16) = 32
+        // KeyParameter = tag(4) + pad(4) + 标量格(8) + hidl_vec 头(16) = 32。
+        // 线上没有联合体判别符，所以标量那一格和 blob 头不重合。
         assert_eq!(KM_PARAM_SIZE, 32);
         assert_eq!(KM_PARAM_F_OFF, 8);
         assert_eq!(KM_PARAM_BLOB_OFF, 16);

@@ -25,8 +25,8 @@
 use anyhow::Result;
 
 use ommegaclient_b::keymaster::hidl_km::{
-    HidlKeymaster, KmParam, TAG_ALGORITHM, TAG_DIGEST, TAG_EC_CURVE, TAG_KEY_SIZE,
-    TAG_NO_AUTH_REQUIRED, TAG_PURPOSE,
+    HidlKeymaster, KmParam, TAG_ALGORITHM, TAG_APPLICATION_ID, TAG_DIGEST, TAG_EC_CURVE,
+    TAG_KEY_SIZE, TAG_NO_AUTH_REQUIRED, TAG_PURPOSE, TAG_RSA_PUBLIC_EXPONENT,
 };
 
 /// `KeyPurpose::SIGN`。
@@ -89,9 +89,27 @@ fn main() -> Result<()> {
         Ok(()) => println!("   ✓ OK"),
         Err(e) => println!("   ✗ {e:#}（链路通了但 TEE 拒了，也算验过）"),
     }
+    // 对照实验：`addRngEntropy` 即使把 vec 读成空的也可能返回 OK，所以它单独
+    // 证明不了「vec 参数被读进来了」。`deleteKey` 拿一个垃圾 blob 一定会被 TEE
+    // 拒绝，但拒绝的形状能区分两件事：`KM_ERROR_*`（小负数）= 参数读进去了；
+    // `-22 BAD_VALUE` = 连读都没读成功。
+    println!("-- 3b 对照：deleteKey(vec<uint8_t>) 垃圾 blob --");
+    match km.delete_key(&[0xAAu8; 32]) {
+        Ok(()) => println!("   ✓ 居然删成功了（不该）"),
+        Err(e) => println!("   → {e:#}"),
+    }
+    println!("-- 3c 对照：addRngEntropy(空 vec) --");
+    match km.add_rng_entropy(&[]) {
+        Ok(()) => println!("   ✓ OK"),
+        Err(e) => println!("   → {e:#}"),
+    }
 
     println!("== 4. generateKey(vec<KeyParameter>)（验 32 字节定长布局）==");
-    let params = vec![
+    // 分三档，把「对象形状」和「元素内容」分开验：
+    //   4a 空 vector —— 只涉及头 + 元素数组两个对象；
+    //   4b 只有标量 —— 加上 32 字节元素本身，没有嵌套对象；
+    //   4c 标量 + blob —— 再加上联合体判别式和嵌套 buffer object。
+    let scalars = vec![
         KmParam::integer(TAG_PURPOSE, PURPOSE_SIGN),
         KmParam::integer(TAG_ALGORITHM, ALGORITHM_EC),
         KmParam::integer(TAG_KEY_SIZE, 256),
@@ -99,15 +117,66 @@ fn main() -> Result<()> {
         KmParam::integer(TAG_EC_CURVE, EC_CURVE_P256),
         KmParam::flag(TAG_NO_AUTH_REQUIRED),
     ];
-    match km.generate_key(&params) {
+    let with_blob = vec![
+        KmParam::integer(TAG_PURPOSE, PURPOSE_SIGN),
+        KmParam::integer(TAG_ALGORITHM, ALGORITHM_EC),
+        KmParam::integer(TAG_KEY_SIZE, 256),
+        KmParam::integer(TAG_DIGEST, DIGEST_SHA_256),
+        KmParam::integer(TAG_EC_CURVE, EC_CURVE_P256),
+        KmParam::flag(TAG_NO_AUTH_REQUIRED),
+        KmParam::blob(TAG_APPLICATION_ID, b"km4-probe".to_vec()),
+    ];
+
+    try_generate_key(&km, "4a 空 vector（只有头 + 元素数组）", &[]);
+    try_generate_key(&km, "4b 只有标量（无嵌套 blob）", &scalars);
+    try_generate_key(&km, "4c 标量 + 一个 blob", &with_blob);
+
+    // 4b/4c 已经过了参数读取、被 TEE 以 `UNSUPPORTED_KEY_SIZE` 拒掉。下面几档把
+    // 「KEY_SIZE 这个值 TEE 到底读到没有」和「64 位 tag 走 longInteger 对不对」分开。
+    // 数字直接写：Algorithm::RSA=1 / EC=3，EcCurve::P256=1 / P384=2，
+    // Digest::SHA256=4 / SHA384=5，KeyPurpose::SIGN=2。
+    let ec_no_size = vec![
+        KmParam::integer(TAG_PURPOSE, PURPOSE_SIGN),
+        KmParam::integer(TAG_ALGORITHM, ALGORITHM_EC),
+        KmParam::integer(TAG_DIGEST, DIGEST_SHA_256),
+        KmParam::integer(TAG_EC_CURVE, EC_CURVE_P256),
+        KmParam::flag(TAG_NO_AUTH_REQUIRED),
+    ];
+    let ec_384 = vec![
+        KmParam::integer(TAG_PURPOSE, 2),
+        KmParam::integer(TAG_ALGORITHM, 3),
+        KmParam::integer(TAG_KEY_SIZE, 384),
+        KmParam::integer(TAG_DIGEST, 5),
+        KmParam::integer(TAG_EC_CURVE, 2),
+        KmParam::flag(TAG_NO_AUTH_REQUIRED),
+    ];
+    let rsa = vec![
+        KmParam::integer(TAG_PURPOSE, 2),
+        KmParam::integer(TAG_ALGORITHM, 1),
+        KmParam::integer(TAG_KEY_SIZE, 2048),
+        KmParam::long(TAG_RSA_PUBLIC_EXPONENT, 65537),
+        KmParam::integer(TAG_DIGEST, 4),
+        KmParam::flag(TAG_NO_AUTH_REQUIRED),
+    ];
+    try_generate_key(&km, "4d EC 不带 KEY_SIZE", &ec_no_size);
+    try_generate_key(&km, "4e EC P-384 + KEY_SIZE=384", &ec_384);
+    try_generate_key(&km, "4f RSA 2048 + 公开指数 65537（验 64 位 tag）", &rsa);
+
+    println!("\n探针结束。");
+    Ok(())
+}
+
+/// 跑一次 `generateKey` 并把结果说清楚。空的参数集必然拿不到密钥，所以 4a 那档
+/// 看的是「错误码长什么样」：`BAD_VALUE`(-22) 说明读参数就失败了，换成
+/// `KM_ERROR_*` 的小负数才说明参数读进去了、是 TEE 不认这套 tag。
+fn try_generate_key(km: &HidlKeymaster, label: &str, params: &[KmParam]) {
+    println!("-- {label} --");
+    match km.generate_key(params) {
         Ok(gen) => {
             println!("   ✓ keyblob {} 字节", gen.key_blob.len());
             println!(
-                "     softwareEnforced = {} 项",
-                gen.characteristics.software_enforced.len()
-            );
-            println!(
-                "     hardwareEnforced = {} 项",
+                "     softwareEnforced = {} 项，hardwareEnforced = {} 项",
+                gen.characteristics.software_enforced.len(),
                 gen.characteristics.hardware_enforced.len()
             );
             for p in gen
@@ -119,20 +188,11 @@ fn main() -> Result<()> {
             {
                 println!("       tag 0x{:08X} = {:?}", p.tag, p.value);
             }
-            println!("   → KeyParameter 布局、KeyCharacteristics 回包解码都对上了。");
-
             match km.delete_key(&gen.key_blob) {
                 Ok(()) => println!("   ✓ 顺手把刚生成的密钥删了"),
                 Err(e) => println!("   ✗ deleteKey 失败：{e:#}"),
             }
         }
-        Err(e) => {
-            println!("   ✗ {e:#}");
-            println!("   → 看 ErrorCode：UNSUPPORTED_TAG / INVALID_TAG 说明参数编对了、");
-            println!("     是真 TEE 不认这套 tag；Status 非 0 才是布局编错。");
-        }
+        Err(e) => println!("   ✗ {e:#}"),
     }
-
-    println!("\n探针结束。");
-    Ok(())
 }
