@@ -58,6 +58,10 @@ fn main() -> Result<()> {
         km.handle(),
         km.version().hal_version()
     );
+    println!(
+        "     ↑ 这是连上后自检出来、对端真正认的那个 interface descriptor；\
+         \n       它不一定等于 getService 用的注册名（MTK 有实现以 @4.1 注册、只认 @4.0）。"
+    );
 
     println!("== 2. getHardwareInfo()（不碰结构体布局）==");
     match km.get_hardware_info() {

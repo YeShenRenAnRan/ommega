@@ -69,7 +69,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::soter::hidl::HW_SERVICE_MANAGER_DESCRIPTOR;
 use crate::soter::hwbinder::{
-    HwBinder, Parcel, Reply, BINDER_BUFFER_FLAG_HAS_PARENT, HIDL_STRUCT_SIZE,
+    HwBinder, Parcel, Reply, BINDER_BUFFER_FLAG_HAS_PARENT, BINDER_TYPE_BINDER, BINDER_TYPE_HANDLE,
+    BINDER_TYPE_WEAK_BINDER, BINDER_TYPE_WEAK_HANDLE, HIDL_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,7 +131,10 @@ pub const TX_EARLY_BOOT_ENDED: u32 = 21;
 // 版本。
 // ---------------------------------------------------------------------------
 
-/// 设备上注册的 HIDL Keymaster 版本。
+/// 对端**真正接受**的 HIDL Keymaster 版本。
+///
+/// 它由 interface descriptor 自检得出，不是 `getService` 时用的那个名字 ——
+/// 两者在厂商实现上会不一致，见 [`accepted_version`]。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Km4Version {
     /// `@4.0`（Android 11 出厂设备的常见形态）。
@@ -140,11 +144,20 @@ pub enum Km4Version {
 }
 
 impl Km4Version {
-    /// 服务全名（同时就是 HIDL 的 interface descriptor）。
+    /// 服务全名。正常情况下它同时也是对端校验的 interface descriptor；
+    /// 不一致时以自检结果为准，见 [`accepted_version`]。
     pub fn fq_name(self) -> &'static str {
         match self {
             Self::V40 => KM4_FQNAME_V40,
             Self::V41 => KM4_FQNAME_V41,
+        }
+    }
+
+    /// 另一个版本。descriptor 自检失败时用来兜底。
+    fn other(self) -> Self {
+        match self {
+            Self::V40 => Self::V41,
+            Self::V41 => Self::V40,
         }
     }
 
@@ -371,10 +384,30 @@ impl HidlKeymaster {
             return Ok(None);
         }
         let conn = HwBinder::open().context("open /dev/hwbinder")?;
-        for version in PROBE_ORDER {
+        for wanted in PROBE_ORDER {
             if let Some(handle) =
-                fetch_service_handle(&conn, version.fq_name(), KM4_DEFAULT_INSTANCE)?
+                fetch_service_handle(&conn, wanted.fq_name(), KM4_DEFAULT_INSTANCE)?
             {
+                // 服务在，但注册名不等于对端认的 descriptor，得自检。
+                let version = accepted_version(&conn, handle, wanted)?.with_context(|| {
+                    format!(
+                        "{}/{} answered getService but rejected both the {} and {} \
+                         interface descriptors",
+                        wanted.fq_name(),
+                        KM4_DEFAULT_INSTANCE,
+                        wanted.fq_name(),
+                        wanted.other().fq_name()
+                    )
+                })?;
+                if version != wanted {
+                    log::info!(
+                        "{}/{} accepts only the {} interface descriptor, not {}",
+                        wanted.fq_name(),
+                        KM4_DEFAULT_INSTANCE,
+                        version.fq_name(),
+                        wanted.fq_name()
+                    );
+                }
                 return Ok(Some(Self {
                     conn,
                     handle,
@@ -387,7 +420,7 @@ impl HidlKeymaster {
 
     /// 指定服务全名和实例名。`fq_name` 必须是本模块认得的两个之一。
     pub fn open_named(fq_name: &str, instance: &str) -> Result<Option<Self>> {
-        let version = match fq_name {
+        let wanted = match fq_name {
             KM4_FQNAME_V41 => Km4Version::V41,
             KM4_FQNAME_V40 => Km4Version::V40,
             other => bail!(
@@ -400,11 +433,21 @@ impl HidlKeymaster {
         }
         let conn = HwBinder::open().context("open /dev/hwbinder")?;
         match fetch_service_handle(&conn, fq_name, instance)? {
-            Some(handle) => Ok(Some(Self {
-                conn,
-                handle,
-                version,
-            })),
+            Some(handle) => {
+                let version = accepted_version(&conn, handle, wanted)?.with_context(|| {
+                    format!(
+                        "{fq_name}/{instance} answered getService but rejected both the {} \
+                         and {} interface descriptors",
+                        wanted.fq_name(),
+                        wanted.other().fq_name()
+                    )
+                })?;
+                Ok(Some(Self {
+                    conn,
+                    handle,
+                    version,
+                }))
+            }
             None => Ok(None),
         }
     }
@@ -725,6 +768,46 @@ fn fetch_service_handle(conn: &HwBinder, fq_name: &str, instance: &str) -> Resul
 }
 
 // ---------------------------------------------------------------------------
+// interface descriptor 自检。
+// ---------------------------------------------------------------------------
+
+/// 用 `getHardwareInfo` 试一笔，看对端认不认这个版本对应的 interface descriptor。
+///
+/// 选它当探针是因为它在 4.0 和 4.1 上都是事务号 1、不带参数、没有副作用。
+fn descriptor_answers(conn: &HwBinder, handle: u32, version: Km4Version) -> Result<bool> {
+    let mut parcel = Parcel::new();
+    parcel.write_interface_token(version.fq_name());
+    let reply = conn.transact(handle, TX_GET_HARDWARE_INFO, &parcel)?;
+    Ok(reply_is_body(&reply))
+}
+
+/// 问出对端真正接受的 interface descriptor，并据此定版本。
+///
+/// 正常情况下它就是请求服务时用的那个全名，所以先试它。但**厂商实现会两张皮**：
+/// 这台天玑 1200 上，keymaster 二进制被以 `@4.1` 的名字注册进了 hwservicemanager
+/// （`lshal` 能看到 `@4.1::IKeymasterDevice/default`），可它 `onTransact` 里
+/// `enforceInterface` 校验的是 `@4.0` 的 descriptor —— 于是
+/// `getService("@4.1")` 拿到的句柄发 `@4.1` 的 token 会被 `BAD_TYPE`
+/// （`0x80000001` = `-2147483647`）拒掉，只有 `@4.0` 的 token 能通。更麻烦的是
+/// `get("@4.1")` 和 `get("@4.0")` 返回的是**同一个句柄**，光看句柄发现不了。
+///
+/// 所以版本必须自检，不能由注册名推。认哪个 descriptor 就按哪个版本算 ——
+/// 这也顺带保证 4.1 独有的 `deviceLocked`/`earlyBootEnded` 不会被发到 4.0
+/// 的实现上去（那会得到 `UNKNOWN_TRANSACTION`）。
+fn accepted_version(
+    conn: &HwBinder,
+    handle: u32,
+    wanted: Km4Version,
+) -> Result<Option<Km4Version>> {
+    for version in [wanted, wanted.other()] {
+        if descriptor_answers(conn, handle, version)? {
+            return Ok(Some(version));
+        }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // 编码：往 parcel 里写 HIDL 形参。
 // ---------------------------------------------------------------------------
 
@@ -1015,9 +1098,22 @@ impl<'a> ReplyReader<'a> {
     }
 
     /// HIDL 里 `hardware::Status` 是个 i32：0 就是没事。
+    ///
+    /// 非 0 时回包长度很关键：**只有 4 字节**说明这是一条 `TF_STATUS_CODE` 应答 ——
+    /// 服务端的 `onTransact` 拒绝了这笔事务，回包的整个内容就是它自己的返回值，
+    /// 根本不是方法的应答体。这种情况报成「HIDL status 非 0」会把人引到 binder
+    /// 传输层上去查，而真正的原因几乎总在那里写的 interface descriptor 上。
     fn status(&mut self) -> Result<()> {
         let code = self.i32()?;
         if code != 0 {
+            if self.reply.data.len() == 4 {
+                bail!(
+                    "the service rejected this transaction with status {code} ({}); \
+                     a 4-byte reply is the HAL's own onTransact return value, \
+                     not a transport failure",
+                    binder_status_name(code)
+                );
+            }
             bail!("HIDL reply carried a non-OK Status ({code})");
         }
         Ok(())
@@ -1283,19 +1379,66 @@ impl<'a> ReplyReader<'a> {
         if mark == 0 {
             return Ok(None);
         }
-        if object_at + 24 > self.reply.data.len() {
-            bail!(
-                "truncated reply binder object at {object_at}: only {} bytes left",
-                self.reply.data.len() - object_at
-            );
-        }
-        // 本地对象（BINDER_TYPE_BINDER）和远程句柄（BINDER_TYPE_HANDLE）都接受：
-        // HAL 可能就在自己进程里（passthrough）。
-        let data = &self.reply.data[object_at..object_at + 24];
-        let handle = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let handle = binder_handle_at(&self.reply.data, object_at)?;
         self.at = object_at + 24;
         Ok(Some(handle))
     }
+}
+
+/// 从一个 `flat_binder_object` 里抠出句柄。
+///
+/// uapi 在 64 位下的布局是 `type@0, flags@4, union{binder: u64 | handle: u32}@8,
+/// cookie@16`，一共 24 字节。句柄是 union 那格的低 4 字节，也就是**偏移 8**。
+///
+/// 偏移 12 **不是**句柄：那只是 union 内部的对齐补位，对远程句柄恒为 0。读那里会
+/// 得到 handle 0，而 0 是 hwservicemanager —— 于是 `getService` 之后的每一笔事务都
+/// 打在上下文管理器上，被它的 `enforceInterface` 以 `BAD_TYPE`(0x80000001，
+/// 也就是 `-2147483647`) 拒掉，看着像 binder 传输层坏了，其实是敲错了门。
+fn binder_handle_at(data: &[u8], object_at: usize) -> Result<u32> {
+    let object = data
+        .get(object_at..object_at + 24)
+        .with_context(|| format!("truncated binder object at {object_at}"))?;
+    let ty = u32::from_le_bytes([object[0], object[1], object[2], object[3]]);
+    // 本地对象（passthrough 的 HAL 就在自己进程里）和远程句柄都接受，
+    // 跟 [`crate::soter::hidl`] 里那份已经跑通的判断保持一致。
+    match ty {
+        BINDER_TYPE_HANDLE
+        | BINDER_TYPE_BINDER
+        | BINDER_TYPE_WEAK_HANDLE
+        | BINDER_TYPE_WEAK_BINDER => {}
+        other => bail!("binder object at {object_at} has unexpected type 0x{other:08x}"),
+    }
+    Ok(u32::from_le_bytes([
+        object[8], object[9], object[10], object[11],
+    ]))
+}
+
+/// 服务端 `onTransact` 拒绝事务时回的两个状态值。
+///
+/// 两个数都是在天玑 1200 上实测的：换掉 interface descriptor 得到第一个，换掉
+/// 事务号得到第二个。它们**是不同的数**，所以能据此区分「敲错门」和「敲门的方式
+/// 不对」—— 这一点在排查时很值钱。
+const BINDER_BAD_TYPE: i32 = -2_147_483_647;
+const BINDER_UNKNOWN_TRANSACTION: i32 = -74;
+
+fn binder_status_name(code: i32) -> &'static str {
+    match code {
+        BINDER_BAD_TYPE => "BAD_TYPE, the interface descriptor did not match",
+        BINDER_UNKNOWN_TRANSACTION => "UNKNOWN_TRANSACTION, no such transaction code",
+        _ => "unrecognised status",
+    }
+}
+
+/// 这条应答算不算方法的真应答体（而不是 4 字节的裸状态）。
+///
+/// 对端认这个 descriptor 时，`getHardwareInfo` 至少会回 status + `SecurityLevel`
+/// + 两个 16 字节的 `hidl_string` 头，远不止 4 字节；不认时回的就是 4 字节裸状态。
+fn reply_is_body(reply: &Reply) -> bool {
+    if reply.data.len() <= 4 {
+        return false;
+    }
+    let head = &reply.data[..4];
+    i32::from_le_bytes([head[0], head[1], head[2], head[3]]) == 0
 }
 
 fn read_u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -1413,6 +1556,7 @@ pub fn error_code_name(code: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::soter::hwbinder::BINDER_TYPE_PTR;
 
     #[test]
     fn tag_values_match_types_hal() {
@@ -1473,5 +1617,77 @@ mod tests {
         assert_eq!(TX_EARLY_BOOT_ENDED, 21);
         assert!(Km4Version::V41.has_v41_methods());
         assert!(!Km4Version::V40.has_v41_methods());
+    }
+
+    /// 64 位下 `flat_binder_object` 就是 `type@0, flags@4, handle@8, cookie@16`。
+    ///
+    /// 这个测试盯着**偏移 8**：曾经写成 12（union 里的对齐补位），结果句柄恒为 0
+    /// = hwservicemanager，`getService` 之后每笔事务都被 `BAD_TYPE` 拒掉。真机上的
+    /// 表现是 `getHardwareInfo` 报 `-2147483647`，看着像 binder 传输层坏了。
+    #[test]
+    fn binder_object_handle_is_at_offset_eight() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&BINDER_TYPE_HANDLE.to_le_bytes()); // type
+        data.extend_from_slice(&0u32.to_le_bytes()); // flags
+        data.extend_from_slice(&7u32.to_le_bytes()); // union: handle
+        data.extend_from_slice(&0u32.to_le_bytes()); // union 的对齐补位
+        data.extend_from_slice(&0u64.to_le_bytes()); // cookie
+        assert_eq!(data.len(), 24, "64 位的 flat_binder_object 是 24 字节");
+        assert_eq!(binder_handle_at(&data, 0).unwrap(), 7);
+    }
+
+    /// 类型不对要报错，别把「偏移读错、拿到 0」这种事故静默成 handle 0。
+    #[test]
+    fn a_non_binder_object_is_rejected() {
+        let mut data = BINDER_TYPE_PTR.to_le_bytes().to_vec(); // pt* = buffer object
+        data.extend_from_slice(&[0u8; 20]);
+        assert!(binder_handle_at(&data, 0).is_err());
+    }
+
+    /// 截断的对象要报错，而不是越界读。
+    #[test]
+    fn a_truncated_binder_object_is_rejected() {
+        assert!(binder_handle_at(&[0u8; 23], 0).is_err());
+    }
+
+    /// descriptor 自检的判据：真应答体 vs 4 字节裸状态。
+    ///
+    /// 这两个形状是在天玑 1200 上实测到的 —— 对端认 descriptor 时
+    /// `getHardwareInfo` 回 168 字节，不认时回 4 字节 `BAD_TYPE`。
+    #[test]
+    fn descriptor_probe_distinguishes_a_body_from_a_bare_status() {
+        let body = Reply {
+            data: vec![0, 0, 0, 0, 1, 0, 0, 0],
+            offsets: Vec::new(),
+        };
+        assert!(reply_is_body(&body));
+
+        let rejected = Reply {
+            data: BINDER_BAD_TYPE.to_le_bytes().to_vec(),
+            offsets: Vec::new(),
+        };
+        assert!(!reply_is_body(&rejected));
+
+        assert!(!reply_is_body(&Reply {
+            data: Vec::new(),
+            offsets: Vec::new(),
+        }));
+    }
+
+    /// 两个拒绝状态必须是不同的数：一个是敲错门，一个是敲门方式不对。
+    #[test]
+    fn the_two_rejection_statuses_are_told_apart() {
+        assert_ne!(BINDER_BAD_TYPE, BINDER_UNKNOWN_TRANSACTION);
+        assert!(binder_status_name(BINDER_BAD_TYPE).contains("descriptor"));
+        assert!(binder_status_name(BINDER_UNKNOWN_TRANSACTION).contains("transaction code"));
+    }
+
+    /// 自检必须把「另一个版本」也试到：以 `@4.1` 之名注册、却只认 `@4.0`
+    /// descriptor 的实现，就是靠这一步救回来的。
+    #[test]
+    fn descriptor_self_check_falls_back_to_the_other_version() {
+        assert_eq!(Km4Version::V41.other(), Km4Version::V40);
+        assert_eq!(Km4Version::V40.other(), Km4Version::V41);
+        assert_ne!(Km4Version::V41.fq_name(), Km4Version::V40.fq_name());
     }
 }
