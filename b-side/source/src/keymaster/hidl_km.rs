@@ -372,7 +372,8 @@ impl HidlKeymaster {
         }
         let conn = HwBinder::open().context("open /dev/hwbinder")?;
         for version in PROBE_ORDER {
-            if let Some(handle) = fetch_service_handle(&conn, version.fq_name(), KM4_DEFAULT_INSTANCE)?
+            if let Some(handle) =
+                fetch_service_handle(&conn, version.fq_name(), KM4_DEFAULT_INSTANCE)?
             {
                 return Ok(Some(Self {
                     conn,
@@ -525,7 +526,11 @@ impl HidlKeymaster {
     ///
     /// 这就是 KeyMint 里 `generateKey(keyParams, attestKeyParams)` 的
     /// `attestKeyParams` 那一半，KM4 上必须单独发。
-    pub fn attest_key(&self, key_to_attest: &[u8], attest_params: &[KmParam]) -> Result<Vec<Vec<u8>>> {
+    pub fn attest_key(
+        &self,
+        key_to_attest: &[u8],
+        attest_params: &[KmParam],
+    ) -> Result<Vec<Vec<u8>>> {
         let reply = self.call(TX_ATTEST_KEY, |p| {
             p.write_hidl_vec_u8(key_to_attest);
             write_key_params(p, attest_params);
@@ -765,11 +770,11 @@ fn write_key_params(parcel: &mut Parcel, params: &[KmParam]) {
                     elems[o + KM_PARAM_F_OFF] = 1;
                 }
             }
-            KmValue::Integer(v) => elems[o + KM_PARAM_F_OFF..o + KM_PARAM_F_OFF + 4]
-                .copy_from_slice(&v.to_le_bytes()),
+            KmValue::Integer(v) => {
+                elems[o + KM_PARAM_F_OFF..o + KM_PARAM_F_OFF + 4].copy_from_slice(&v.to_le_bytes())
+            }
             KmValue::LongInteger(v) | KmValue::DateTime(v) => {
-                elems[o + KM_PARAM_F_OFF..o + KM_PARAM_F_OFF + 8]
-                    .copy_from_slice(&v.to_le_bytes())
+                elems[o + KM_PARAM_F_OFF..o + KM_PARAM_F_OFF + 8].copy_from_slice(&v.to_le_bytes())
             }
             KmValue::Blob(b) => {
                 let addr = blob_addrs[i].unwrap_or(0);
@@ -967,11 +972,7 @@ struct ReplyReader<'a> {
 
 impl<'a> ReplyReader<'a> {
     fn new(conn: &'a HwBinder, reply: &'a Reply) -> Self {
-        Self {
-            conn,
-            reply,
-            at: 0,
-        }
+        Self { conn, reply, at: 0 }
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -1111,7 +1112,9 @@ impl<'a> ReplyReader<'a> {
         }
         // 字符区带结尾 NUL：数据对象比声明的字符数多一个字节。
         if data_len != chars + 1 {
-            bail!("hidl_string header says {chars} chars but the data object says {data_len} bytes");
+            bail!(
+                "hidl_string header says {chars} chars but the data object says {data_len} bytes"
+            );
         }
         let bytes = self
             .conn
@@ -1140,7 +1143,9 @@ impl<'a> ReplyReader<'a> {
             .context("KeyParameter array is outside our binder mapping")?;
 
         let mut out = Vec::with_capacity(count);
-        for (i, chunk) in bytes.chunks_exact(KM_PARAM_SIZE).enumerate() {
+        // 块长是常量，用 `as_chunks` 切出来就是 `&[u8; 32]`，按下标取字段不会越界。
+        // 前面已经校验过字节数是 32 的整数倍，所以余数那一截一定是空的。
+        for (i, chunk) in bytes.as_chunks::<KM_PARAM_SIZE>().0.iter().enumerate() {
             let tag = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
 
             // blob 头里的 (指针, 长度)。长度非 0 就说明后面挂着一个数据对象。
@@ -1176,7 +1181,9 @@ impl<'a> ReplyReader<'a> {
                 ]);
                 match tag_type(tag) {
                     Some(t) if t == TT_BYTES => KmValue::Blob(Vec::new()),
-                    Some(t) if t == TT_DATE => KmValue::DateTime(read_u64_at(chunk, KM_PARAM_F_OFF)),
+                    Some(t) if t == TT_DATE => {
+                        KmValue::DateTime(read_u64_at(chunk, KM_PARAM_F_OFF))
+                    }
                     Some(t) if t == TT_ULONG || t == TT_ULONG_REP => {
                         KmValue::LongInteger(read_u64_at(chunk, KM_PARAM_F_OFF))
                     }
@@ -1232,7 +1239,7 @@ impl<'a> ReplyReader<'a> {
             .context("nested vector heads are outside our binder mapping")?;
 
         let mut out = Vec::with_capacity(count);
-        for (i, head) in heads.chunks_exact(HIDL_STRUCT_SIZE).enumerate() {
+        for (i, head) in heads.as_chunks::<HIDL_STRUCT_SIZE>().0.iter().enumerate() {
             let mut ptr_raw = [0u8; 8];
             ptr_raw.copy_from_slice(&head[0..8]);
             let ptr = u64::from_le_bytes(ptr_raw) as usize;
@@ -1246,7 +1253,9 @@ impl<'a> ReplyReader<'a> {
                 continue;
             }
             if data_addr != ptr {
-                bail!("inner vector {i} header points at {ptr:#x} but the object says {data_addr:#x}");
+                bail!(
+                    "inner vector {i} header points at {ptr:#x} but the object says {data_addr:#x}"
+                );
             }
             if data_len != size {
                 bail!("inner vector {i} header says {size} bytes but the object says {data_len}");
@@ -1313,7 +1322,11 @@ fn check_error_code(code: i32, what: &str) -> Result<()> {
     if code == 0 {
         return Ok(());
     }
-    bail!("{what} returned ErrorCode {} ({})", code, error_code_name(code))
+    bail!(
+        "{what} returned ErrorCode {} ({})",
+        code,
+        error_code_name(code)
+    )
 }
 
 /// `android.hardware.keymaster@4.0::ErrorCode` 的名字表。日志里光有个负数没法看。
