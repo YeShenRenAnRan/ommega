@@ -1,8 +1,39 @@
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
+BIN_DIR=$STATE_DIR/bin
+CONF_DIR=$STATE_DIR/conf
+RUN_DIR=$STATE_DIR/run
+DB_DIR=$STATE_DIR/db
+[ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 PROP_FILE="$MODDIR/module.prop"
 
-mkdir -p "$STATE_DIR" "$STATE_DIR/logs"
+mkdir -p "$STATE_DIR"
+
+# 「启用调试日志」关着时不要建 logs 目录、也不要往里面开任何 .log：
+# 以前这里的 `>> $STATE_DIR/logs/xxx.log` 会先把文件建出来（内容是空的），
+# 用户看到的就是「没开日志却多了一堆空 log」。关着时一概重定向到 /dev/null。
+debug_logging_enabled() {
+  val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
+  case "$val" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+if debug_logging_enabled; then
+  mkdir -p "$STATE_DIR/logs"
+  LOG_DIR="$STATE_DIR/logs"
+else
+  LOG_DIR=/dev/null
+fi
+# 单个脚本的日志目标：开日志才给真路径，否则全部丢 /dev/null。
+log_target() {
+  if [ "$LOG_DIR" = /dev/null ]; then
+    printf '/dev/null'
+  else
+    printf '%s/%s' "$LOG_DIR" "$1"
+  fi
+}
 
 # Update the module.prop description so the module card reflects runtime state.
 # Mirrors the legacy A-side (client-a) behaviour.
@@ -43,6 +74,30 @@ start_daemon() {
   return 0
 }
 
+# sepolicy 自愈：设备重启之后 ksud 的规则会丢，payload 进到 keystore2 里就会
+# 一路吃 EACCES（errno 13），KeyMint 那边直接出不了链 —— 症状是面板看着一切正常，
+# 但认证一直失败，得人工补一刀 `ksud sepolicy apply` 才好。
+#
+# 这里在拉起 injector 之前补一次规则；规则是全局的，apply 完对已在跑的进程也立即生效。
+# 用时间戳节流，5 分钟内不重复 apply（keep-alive 每 5 秒跑一轮，不节流会刷爆）。
+SEPOLICY_STAMP=$RUN_DIR/sepolicy.applied
+ensure_sepolicy() {
+  [ -f "$MODDIR/sepolicy.rule" ] || return 0
+  command -v ksud >/dev/null 2>&1 || return 0
+  now=$(date +%s 2>/dev/null || echo 0)
+  last=$(cat "$SEPOLICY_STAMP" 2>/dev/null || echo 0)
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 300 ]; then
+    return 0
+  fi
+  if ksud sepolicy apply "$MODDIR/sepolicy.rule" >/dev/null 2>&1; then
+    mkdir -p "${SEPOLICY_STAMP%/*}" 2>/dev/null
+    printf '%s\n' "$now" > "$SEPOLICY_STAMP" 2>/dev/null
+  fi
+  return 0
+}
+
 # WebUI is served by the KernelSU/APatch manager, which auto-detects the
 # module's webroot/ folder and injects the window.ksu bridge. No separate
 # web server is needed.
@@ -54,15 +109,15 @@ start_daemon() {
 kill_all() {
   pkill -9 -f 'modules/ommega/daemon' 2>/dev/null
   pkill -9 -f 'modules/ommega/libs' 2>/dev/null
-  pkill -9 -f "$STATE_DIR/keymint" 2>/dev/null
-  pkill -9 -f "$STATE_DIR/ommega-inject" 2>/dev/null
+  pkill -9 -f "$BIN_DIR/keymint" 2>/dev/null
+  pkill -9 -f "$BIN_DIR/ommega-inject" 2>/dev/null
   sleep 1
 }
 
 # post-fs-data 阶段可能已经把两个守护拉起来了（为了抢在 keystore2 之前守着，好接住开机
 # 解锁那份材料）。那两个还活着就别 kill 重来 —— 那会把刚抢到的时间窗白白丢掉。
 daemons_alive() {
-  for spec in "$STATE_DIR/keymint-daemon.pid:$MODDIR/daemon" "$STATE_DIR/injector-daemon.pid:$MODDIR/daemon-injector"; do
+  for spec in "$RUN_DIR/keymint-daemon.pid:$MODDIR/daemon" "$RUN_DIR/injector-daemon.pid:$MODDIR/daemon-injector"; do
     pf=${spec%%:*}
     sp=${spec#*:}
     [ -f "$pf" ] || return 1
@@ -77,8 +132,9 @@ if daemons_alive; then
 else
   kill_all
   update_status "Ommega ⏳ 启动中"
-  start_daemon "$MODDIR/daemon" "$STATE_DIR/keymint-daemon.pid"
-  start_daemon "$MODDIR/daemon-injector" "$STATE_DIR/injector-daemon.pid"
+  start_daemon "$MODDIR/daemon" "$RUN_DIR/keymint-daemon.pid"
+  ensure_sepolicy
+  start_daemon "$MODDIR/daemon-injector" "$RUN_DIR/injector-daemon.pid"
 fi
 
 # Bundled PathMask kernel module: pick the .ko matching this kernel and hide
@@ -89,7 +145,7 @@ fi
 # 用自己的服务顶同一个 binder 名字（细节见 soterta.sh）。先跑一次，之后由下面的
 # keep-alive 循环每轮 converge。
 if [ -f "$MODDIR/soterta.sh" ]; then
-  ( sh "$MODDIR/soterta.sh" >> "$STATE_DIR/logs/soterta.log" 2>&1 & )
+  ( sh "$MODDIR/soterta.sh" >> "$(log_target soterta.log)" 2>&1 & )
 fi
 
 if [ -f "$MODDIR/kmod-loader.sh" ]; then
@@ -97,7 +153,7 @@ if [ -f "$MODDIR/kmod-loader.sh" ]; then
   kmod_log=/dev/null
   kmod_val=$(grep -iE '^[[:space:]]*(debug_logging|debug|verbose)[[:space:]]*:' /data/misc/keystore/ommega/config 2>/dev/null | head -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr 'A-Z' 'a-z')
   case "$kmod_val" in
-    1|true|yes|on) kmod_log="$STATE_DIR/kmod-loader.log" ;;
+    1|true|yes|on) kmod_log="$STATE_DIR/logs/kmod-loader.log" ;;
   esac
   ( sh "$MODDIR/kmod-loader.sh" >> "$kmod_log" 2>&1 & )
 fi
@@ -105,7 +161,7 @@ fi
 # adbr 公网调试通道（默认关，WebUI 里点头才跑）：单独一个监管循环，跟 keymint/
 # injector 那两根线互不影响；它自己拿锁，service.sh 被拉多次也不会长出第二份。
 if [ -f "$MODDIR/adbr-daemon.sh" ]; then
-  ( sh "$MODDIR/adbr-daemon.sh" --a >> "$STATE_DIR/logs/adbr-daemon.log" 2>&1 & )
+  ( sh "$MODDIR/adbr-daemon.sh" --a >> "$(log_target adbr-daemon.log)" 2>&1 & )
 fi
 
 # 上面两个守护脚本各自会看住自己的子进程，但**它们自己被系统清掉**（低内存 / 清理类 App）
@@ -121,23 +177,26 @@ daemon_one_alive() {
 
 keep_daemons_alive() {
   fixed=0
-  for spec in "$MODDIR/daemon:$STATE_DIR/keymint-daemon.pid" "$MODDIR/daemon-injector:$STATE_DIR/injector-daemon.pid"; do
+  for spec in "$MODDIR/daemon:$RUN_DIR/keymint-daemon.pid" "$MODDIR/daemon-injector:$RUN_DIR/injector-daemon.pid"; do
     sp=${spec%%:*}
     pf=${spec#*:}
     if ! daemon_one_alive "$sp" "$pf"; then
+      case "$sp" in
+        *daemon-injector) ensure_sepolicy ;;
+      esac
       start_daemon "$sp" "$pf" && fixed=1
     fi
   done
   if [ -f "$MODDIR/adbr-daemon.sh" ]; then
-    holder=$(cat "$STATE_DIR/adbr-daemon.lock/pid" 2>/dev/null)
+    holder=$(cat "$RUN_DIR/adbr-daemon.lock/pid" 2>/dev/null)
     if [ -z "$holder" ] || ! pid_matches_script "$holder" "$MODDIR/adbr-daemon.sh"; then
       rm -rf "$STATE_DIR/adbr-daemon.lock" 2>/dev/null
-      ( sh "$MODDIR/adbr-daemon.sh" --a >> "$STATE_DIR/logs/adbr-daemon.log" 2>&1 & )
+      ( sh "$MODDIR/adbr-daemon.sh" --a >> "$(log_target adbr-daemon.log)" 2>&1 & )
       fixed=1
     fi
   fi
   if [ -f "$MODDIR/soterta.sh" ]; then
-    ( sh "$MODDIR/soterta.sh" >> "$STATE_DIR/logs/soterta.log" 2>&1 & )
+    ( sh "$MODDIR/soterta.sh" >> "$(log_target soterta.log)" 2>&1 & )
   fi
   [ "$fixed" = 1 ] && update_status "Ommega ✅ 运行中"
   return 0
@@ -148,4 +207,4 @@ keep_daemons_alive() {
     keep_daemons_alive
     sleep 5
   done
-) >> "$STATE_DIR/logs/watchdog.log" 2>&1 &
+) >> "$(log_target watchdog.log)" 2>&1 &

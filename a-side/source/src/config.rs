@@ -668,13 +668,12 @@ impl Config {
 /// `tls_insecure` accept `0|1|false|true|no|yes|off|on`; an empty or
 /// `none`/`off` URL disables the relay. Returns `None` when the file is absent
 /// (or unreadable), in which case the `[remote]` table in `config.toml` is used.
-fn load_clienta_remote_override() -> Option<RemoteConfig> {
-    let contents = std::fs::read_to_string(CLIENTA_CONFIG_PATH).ok()?;
-    if contents.trim().is_empty() {
-        return None;
-    }
-
-    let mut map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+/// 平铺 config 的解析：`key: value` 一行一条，`#` 开头是注释，键名按小写归一。
+///
+/// 同一个文件原来散在三处各扫一遍（remote 覆盖、debug 开关、SOTER 开关），
+/// 改一处忘一处就会「面板上行、实际不行」。现在只留这一份。
+fn parse_flat_config(contents: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -687,6 +686,29 @@ fn load_clienta_remote_override() -> Option<RemoteConfig> {
         let value = line[idx + 1..].trim().to_string();
         map.insert(key, value);
     }
+    map
+}
+
+/// 平铺 config 里的布尔项。`keys` 的顺序就是优先级（同一个值有几个别名时）。
+fn flat_config_bool(map: &std::collections::HashMap<String, String>, keys: &[&str]) -> bool {
+    keys.iter()
+        .find_map(|k| map.get(*k))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn load_clienta_remote_override() -> Option<RemoteConfig> {
+    let contents = std::fs::read_to_string(CLIENTA_CONFIG_PATH).ok()?;
+    if contents.trim().is_empty() {
+        return None;
+    }
+
+    let map = parse_flat_config(&contents);
 
     let get = |keys: &[&str]| -> Option<&str> {
         keys.iter()
@@ -925,7 +947,8 @@ impl Default for RemoteConfig {
             debug_logging: false,
             hide_strongbox: false,
             soter_hide: false,
-            soter_inject: false,
+            // 默认接管 SOTER：接管后才能自己答 ASK/签名，不接管就只能透传原厂 HAL。
+            soter_inject: true,
             soter_uid_map: String::new(),
             soter_local_only_prefixes: default_soter_local_only_prefixes(),
             soter_local_only_uids: String::new(),
@@ -960,24 +983,7 @@ fn flat_config_truthy(keys: &[&str]) -> bool {
     let Ok(contents) = std::fs::read_to_string(CLIENTA_CONFIG_PATH) else {
         return false;
     };
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some(idx) = line.find(':') else {
-            continue;
-        };
-        let key = line[..idx].trim();
-        if !keys.iter().any(|want| key.eq_ignore_ascii_case(want)) {
-            continue;
-        }
-        return matches!(
-            line[idx + 1..].trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        );
-    }
-    false
+    flat_config_bool(&parse_flat_config(&contents), keys)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

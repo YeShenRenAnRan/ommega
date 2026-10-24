@@ -32,13 +32,19 @@
 #   pathmask_takeover=1     take over an already-loaded foreign instance
 
 MODDIR=${0%/*}
+
+STATE_DIR=${KMOD_STATE_DIR:-/data/adb/ommega}
+BIN_DIR=$STATE_DIR/bin
+CONF_DIR=$STATE_DIR/conf
+RUN_DIR=$STATE_DIR/run
+DB_DIR=$STATE_DIR/db
+[ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 KMOD_DIR="$MODDIR/pathmask"
 CONF_PATH=${KMOD_CONF_PATH:-/data/misc/keystore/ommega/config}
 # Both overridable so the loader can be exercised from a scratch directory
 # (KMOD_DRY_RUN=1) without touching the real state.
-STATE_DIR=${KMOD_STATE_DIR:-/data/adb/ommega}
-STATE_FILE="$STATE_DIR/pathmask.state"
-OWNED_FILE="$STATE_DIR/pathmask.owned"
+STATE_FILE="$CONF_DIR/pathmask.state"
+OWNED_FILE="$CONF_DIR/pathmask.owned"
 
 TARGET_PATH=/system/priv-app/SoterService
 SOTER_PKG=com.tencent.soter.soterserver

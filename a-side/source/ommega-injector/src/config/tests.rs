@@ -396,3 +396,37 @@ fn target_file_tells_unset_from_empty() {
         "文件不存在才返回 None，由调用处保留 injector.toml 的默认 scoop"
     );
 }
+
+/// 面板保存的 target.txt 会整个替掉默认 scoop，但工程模式那类「系统 uid + `_app`
+/// 域」的应用必须始终保留：它们的包名是 `system_like`，不在 scoop 里就会被
+/// `RejectedSystemPackage` 挡回去，工模里的 attestation 就拿不到我们的链。
+#[test]
+fn system_uid_apps_stay_in_scope_when_the_panel_replaces_the_list() {
+    let base = InjectorConfig::default();
+    let kept: Vec<String> = base
+        .filter
+        .system_sid_packages
+        .values()
+        .flatten()
+        .cloned()
+        .collect();
+    assert!(
+        kept.iter().any(|pkg| pkg == "com.oplus.engineermode"),
+        "默认配置里应当有工程模式"
+    );
+
+    // 面板只勾了一个普通应用。
+    let mut effective = vec!["com.example.app".to_string()];
+    for packages in base.filter.system_sid_packages.values() {
+        for pkg in packages {
+            if !pkg.is_empty() && !effective.iter().any(|existing| existing == pkg) {
+                effective.push(pkg.clone());
+            }
+        }
+    }
+    assert!(effective.contains(&"com.example.app".to_string()));
+    assert!(
+        effective.contains(&"com.oplus.engineermode".to_string()),
+        "工程模式必须跟着留在 scoop 里"
+    );
+}

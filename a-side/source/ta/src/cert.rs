@@ -280,6 +280,63 @@ pub(crate) fn extract_subject(cert: &keymint::Certificate) -> Result<Vec<u8>, Er
 /// root-of-trust must be reused verbatim for the child leaf — otherwise the
 /// child's ROOT_OF_TRUST disagrees with the attestation key's and detectors
 /// flag the attestation key as tampered.
+/// 远端链里声明的设备身份：B 真机自己那套 brand/device/product/serial/
+/// manufacturer/model，加上它的 verified boot hash。
+///
+/// 拿它去对齐本机属性：一条真机链只能证明那台机器，本机如果说自己叫
+/// 另一个型号，检测器就会报 `device_properties` / VBMeta 摘要不一致。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RemoteDeviceIdentity {
+    pub brand: Option<Vec<u8>>,
+    pub device: Option<Vec<u8>>,
+    pub product: Option<Vec<u8>>,
+    pub serial: Option<Vec<u8>>,
+    pub manufacturer: Option<Vec<u8>>,
+    pub model: Option<Vec<u8>>,
+    pub verified_boot_hash: Option<Vec<u8>>,
+}
+
+/// 从远端叶子证书里抽出上面那套身份。解不开就返回 `None`（不阻断生成）。
+pub(crate) fn parse_remote_device_identity(cert_der: &[u8]) -> Option<RemoteDeviceIdentity> {
+    let cert = <x509_cert::Certificate as Decode>::from_der(cert_der).ok()?;
+    let extensions = cert.tbs_certificate().extensions()?;
+    let att_ext = extensions
+        .iter()
+        .find(|e| e.extn_id == X509_ATTESTATION_EXTENSION_OID)?;
+    let att = AttestationExtension::from_der(att_ext.extn_value.as_bytes()).ok()?;
+
+    // 硬件强制优先，其次软件层。
+    let pick = |hw: &AuthorizationList<'_>, sw: &AuthorizationList<'_>| -> RemoteDeviceIdentity {
+        let ids = if hw.ids.brand.is_some() || hw.ids.model.is_some() {
+            &hw.ids
+        } else {
+            &sw.ids
+        };
+        RemoteDeviceIdentity {
+            brand: ids.brand.as_ref().map(|v| v.to_vec()),
+            device: ids.device.as_ref().map(|v| v.to_vec()),
+            product: ids.product.as_ref().map(|v| v.to_vec()),
+            serial: ids.serial.as_ref().map(|v| v.to_vec()),
+            manufacturer: ids.manufacturer.as_ref().map(|v| v.to_vec()),
+            model: ids.model.as_ref().map(|v| v.to_vec()),
+            verified_boot_hash: None,
+        }
+    };
+    let mut identity = pick(&att.hw_enforced, &att.sw_enforced);
+
+    let rot_der = att
+        .hw_enforced
+        .rot_info
+        .clone()
+        .or_else(|| att.sw_enforced.rot_info.clone());
+    if let Some(rot_der) = rot_der {
+        if let Ok(rot) = RootOfTrust::from_der(&rot_der) {
+            identity.verified_boot_hash = Some(rot.verified_boot_hash.to_vec());
+        }
+    }
+    Some(identity)
+}
+
 pub(crate) fn parse_remote_root_of_trust(
     cert_der: &[u8],
 ) -> Result<Option<RemoteRootOfTrust>, Error> {
@@ -344,6 +401,140 @@ pub(crate) fn parse_remote_root_of_trust(
 fn x509_oid(oid: ObjectIdentifier) -> Result<X509ObjectIdentifier, Error> {
     X509ObjectIdentifier::from_bytes(oid.as_bytes())
         .map_err(|_| Error::from(CommonErrorKind::Der(ErrorKind::OidMalformed)))
+}
+
+/// 核对一张「证明密钥」证书是不是真机硬件的 ATTEST_KEY。
+///
+/// 原生 KeyMint 的签发权限来自 keyblob 的用途，**不是** PKIX 的 CA 属性：真机
+/// （2026-10-23 实测，高通 / MTK Trustonic / Kirin）铸出来的 ATTEST_KEY 叶子
+/// `Key Usage` 只有 `Certificate Sign`（或再加 digitalSignature），**且没有任何
+/// BasicConstraints**。所以这里只认证书里硬件授权的用途：
+///
+/// * `hw_enforced.purpose` 恰好是 `[ATTEST_KEY]`（混了别的用途就不是证明密钥），
+/// * `keymint_security_level` 是 TEE / StrongBox，且与 `attestation_security_level` 一致。
+///
+/// 这样既能拒掉旧实现「把 ATTEST_KEY 换成 SIGN」留下的普通签名密钥证书，也不会
+/// 因为缺少 BasicConstraints 而误杀真机链。
+pub(crate) fn validate_native_attestation_issuer(cert_der: &[u8]) -> Result<(), Error> {
+    let cert = <x509_cert::Certificate as Decode>::from_der(cert_der)
+        .map_err(|e| km_err!(VerificationFailed, "parse attestation issuer: {e:?}"))?;
+    let extensions = cert
+        .tbs_certificate()
+        .extensions()
+        .ok_or_else(|| km_err!(IncompatiblePurpose, "attestation issuer has no extensions"))?;
+    let extension = extensions
+        .iter()
+        .find(|extension| extension.extn_id == X509_ATTESTATION_EXTENSION_OID)
+        .ok_or_else(|| km_err!(IncompatiblePurpose, "issuer has no hardware attestation"))?;
+    let attestation = AttestationExtension::from_der(extension.extn_value.as_bytes())
+        .map_err(|e| km_err!(VerificationFailed, "parse native issuer attestation: {e:?}"))?;
+    let hardware = matches!(
+        attestation.keymint_security_level,
+        SecurityLevel::TrustedEnvironment | SecurityLevel::Strongbox
+    ) && attestation.attestation_security_level
+        == attestation.keymint_security_level;
+    let attest_only = attestation
+        .hw_enforced
+        .auths
+        .iter()
+        .filter_map(|param| match param {
+            KeyParam::Purpose(purpose) => Some(*purpose),
+            _ => None,
+        })
+        .eq([KeyPurpose::AttestKey]);
+    if !hardware || !attest_only {
+        return Err(km_err!(
+            IncompatiblePurpose,
+            "issuer lacks exclusive hardware ATTEST_KEY authorization"
+        ));
+    }
+    Ok(())
+}
+
+/// 校验 B 端确实用了调用方指定的那把证明密钥来签发子证书。
+///
+/// 凡是结构上对不上就报 `VerificationFailed`（**不能**回退到其它签发密钥：
+/// 旧版 B 会忽略委派参数、改用本机批量 key 签一张无关的证书，那种链必须被拒），
+/// 然后再用父证书公钥真的验一遍子证书签名。
+pub(crate) fn validate_remote_delegation(
+    chain: &[Vec<u8>],
+    issuer: &crate::device::RemoteAttestationKey,
+) -> Result<(), Error> {
+    use ring::signature;
+
+    let invalid = || km_err!(VerificationFailed, "remote certificate issuer mismatch");
+    if chain.len() < 2 {
+        return Err(invalid());
+    }
+    let leaf = <x509_cert::Certificate as Decode>::from_der(&chain[0]).map_err(|_| invalid())?;
+    let parent = <x509_cert::Certificate as Decode>::from_der(&chain[1]).map_err(|_| invalid())?;
+    let spki = parent.tbs_certificate().subject_public_key_info();
+    if spki.to_der().map_err(|_| invalid())? != issuer.public_key
+        || parent
+            .tbs_certificate()
+            .subject()
+            .to_der()
+            .map_err(|_| invalid())?
+            != issuer.issuer_subject_name
+        || leaf.tbs_certificate().issuer() != parent.tbs_certificate().subject()
+        || leaf.signature_algorithm() != leaf.tbs_certificate().signature()
+    {
+        return Err(invalid());
+    }
+    validate_native_attestation_issuer(&chain[1])?;
+    let key_oid = spki.algorithm.oid.to_string();
+    let signature_oid = leaf.signature_algorithm().oid.to_string();
+    let curve_oid = spki
+        .algorithm
+        .parameters
+        .as_ref()
+        .and_then(|p| p.decode_as::<X509ObjectIdentifier>().ok())
+        .map(|oid| oid.to_string());
+    let algorithm: &dyn signature::VerificationAlgorithm = match (
+        key_oid.as_str(),
+        curve_oid.as_deref(),
+        signature_oid.as_str(),
+    ) {
+        ("1.2.840.10045.2.1", Some("1.2.840.10045.3.1.7"), "1.2.840.10045.4.3.2") => {
+            &signature::ECDSA_P256_SHA256_ASN1
+        }
+        ("1.2.840.10045.2.1", Some("1.2.840.10045.3.1.7"), "1.2.840.10045.4.3.3") => {
+            &signature::ECDSA_P256_SHA384_ASN1
+        }
+        ("1.2.840.10045.2.1", Some("1.3.132.0.34"), "1.2.840.10045.4.3.2") => {
+            &signature::ECDSA_P384_SHA256_ASN1
+        }
+        ("1.2.840.10045.2.1", Some("1.3.132.0.34"), "1.2.840.10045.4.3.3") => {
+            &signature::ECDSA_P384_SHA384_ASN1
+        }
+        ("1.2.840.113549.1.1.1", _, "1.2.840.113549.1.1.11") => {
+            &signature::RSA_PKCS1_2048_8192_SHA256
+        }
+        ("1.2.840.113549.1.1.1", _, "1.2.840.113549.1.1.12") => {
+            &signature::RSA_PKCS1_2048_8192_SHA384
+        }
+        ("1.2.840.113549.1.1.1", _, "1.2.840.113549.1.1.13") => {
+            &signature::RSA_PKCS1_2048_8192_SHA512
+        }
+        ("1.3.101.112", None, "1.3.101.112") => &signature::ED25519,
+        _ => {
+            return Err(km_err!(
+                IncompatibleAlgorithm,
+                "unsupported delegated issuer signature algorithm"
+            ))
+        }
+    };
+    let public_key = spki.subject_public_key.as_bytes().ok_or_else(invalid)?;
+    let signature = leaf.signature().as_bytes().ok_or_else(invalid)?;
+    let tbs = leaf.tbs_certificate().to_der().map_err(|_| invalid())?;
+    signature::UnparsedPublicKey::new(algorithm, public_key)
+        .verify(&tbs, signature)
+        .map_err(|_| {
+            km_err!(
+                VerificationFailed,
+                "remote child certificate signature mismatch"
+            )
+        })
 }
 
 /// Construct x.509-cert::time::Time from `DateTime`.

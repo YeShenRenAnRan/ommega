@@ -78,6 +78,20 @@ allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } system_app_
 # 同上：memfd 镜像的写入。这个域（一加 13 / 努比亚 Z60 Ultra 实测）就是它卡的。
 allow { vendor_hal_soter_qti hal_soter_trustonic hal_soter_service } tmpfs file { write getattr read execute map }
 
+# H3 = hal_cryptoeng_oplus（一加 PGP110 / 安卓 15 实测）：oplus 的 cryptoeng HAL 是工程
+# 模式那页到 HIDL soter 的中间人（cryptoeng → vendor.qti.hardware.soter@1.0::ISoter），
+# 想拦它那条 verifyAttkKeyPair 就得注进它。它跟上面那几组一样：收 payload、写 memfd
+# 镜像、连 daemon 的 RPC socket、落日志。
+allow { hal_cryptoeng_oplus } system_file unix_dgram_socket { getattr read recvfrom }
+allow { system_file ksu magisk su } { hal_cryptoeng_oplus } unix_dgram_socket sendto
+allow { hal_cryptoeng_oplus } system_file file { execute getattr map read receive }
+allow { hal_cryptoeng_oplus } keystore unix_stream_socket { connectto read write getattr getopt shutdown ioctl }
+allow { hal_cryptoeng_oplus } system_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { hal_cryptoeng_oplus } system_data_file file { open read write create append getattr setattr rename unlink }
+allow { hal_cryptoeng_oplus } system_app_data_file dir { getattr open read write add_name remove_name rename search lock setattr }
+allow { hal_cryptoeng_oplus } system_app_data_file file { open read write create append getattr setattr rename unlink }
+allow { hal_cryptoeng_oplus } tmpfs file { write getattr read execute map }
+
 # 软件 SOTER TA（soterta.sh 拉起的 `ommega-inject --soterta-serve`）：它要把
 # `vendor.qti.hardware.soter.ISoter/default` 注册到 servicemanager，客户端（宿主、
 # oplus 的 cryptoeng）按名字 + 接口名去拿。find 不够，得能 add。

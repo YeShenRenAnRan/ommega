@@ -31,6 +31,9 @@ pub const FOLLOW_PKGS_KEY: &str = "OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS";
 const OS_PROP: &str = "ro.build.version.security_patch";
 const VENDOR_PROP: &str = "ro.vendor.build.security_patch";
 
+/// 开机时真机原值的落盘位置（面板恢复按钮读它）。
+const BASELINE_FILE: &str = "/data/adb/ommega-b/conf/baseline.props";
+
 /// 用户存储（CE）是否已就绪。`true` 等于「开机后至少解过一次锁」。
 const CE_AVAILABLE_PROP: &str = "sys.user.0.ce_available";
 
@@ -46,14 +49,78 @@ fn ce_unlocked_from_prop(value: Option<&str>) -> bool {
     matches!(value, Some("true"))
 }
 
-/// 找 resetprop：KernelSU / APatch 都自带，模块目录里也可能放了一份。
+/// 找 resetprop：模块目录、KernelSU、APatch、Magisk 都试一遍，最后再靠 PATH。
+/// 不同 root 管理器的位置就是不一样，只认一个等于「换了管理器这功能就没了」。
 const RESETPROP_CANDIDATES: &[&str] = &[
-    "/data/adb/ommega/resetprop",
+    "/data/adb/ommega-b/bin/resetprop",
     "/data/adb/ksu/bin/resetprop",
     "/data/adb/ap/bin/resetprop",
+    "/data/adb/magisk/resetprop",
+    "/debug_ramdisk/resetprop",
 ];
 
 static KNOWN_SERVICE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// 本机原始的三个值（第一次跟着改之前记下来）。
+///
+/// 为什么要记：跟完之后属性会一直是 A 的值，本机所有应用看到的系统版本/补丁日期
+/// 都变成别人的。所以每笔出完链必须自己回原值 —— 用这份基线，而不是「上一笔的值」：
+/// 上一笔可能已经是 A 的，拿它当基线就永远回不去了。
+static BASELINE: OnceLock<Mutex<Option<Vec<(String, String)>>>> = OnceLock::new();
+
+fn baseline_slot() -> &'static Mutex<Option<Vec<(String, String)>>> {
+    BASELINE.get_or_init(|| Mutex::new(None))
+}
+
+fn baseline_value(prop: &str) -> Option<String> {
+    let slot = match baseline_slot().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    slot.as_ref()?
+        .iter()
+        .find(|(k, _)| k == prop)
+        .map(|(_, v)| v.clone())
+}
+
+/// 第一次动属性前把三项的原值记下来（只记一次）。
+fn remember_baseline(props: &[&str]) {
+    let mut slot = match baseline_slot().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if slot.is_some() {
+        return;
+    }
+    let mut pairs = Vec::new();
+    for prop in props {
+        if let Ok(v) = getprop(prop) {
+            if !v.is_empty() {
+                pairs.push(((*prop).to_string(), v));
+            }
+        }
+    }
+    // 落一份到磁盘：面板的「停止模块 / 恢复并重启」要拿它把真机原值写回去，
+    // 而面板是另一个进程、拿不到这里的内存。
+    let mut text = String::new();
+    for (k, v) in &pairs {
+        text.push_str(k);
+        text.push_str(": ");
+        text.push_str(v);
+        text.push('\n');
+    }
+    if !text.is_empty() {
+        if let Some(dir) = std::path::Path::new(BASELINE_FILE).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if !std::path::Path::new(BASELINE_FILE).exists() {
+            if let Err(e) = std::fs::write(BASELINE_FILE, text) {
+                log::warn!("patchlevel: 写基线文件失败: {e:#}");
+            }
+        }
+    }
+    *slot = Some(pairs);
+}
 
 /// 对齐 + 出链之间不能被别的请求插进来，见 [`lock`]。
 static ATTEST_LOCK: Mutex<()> = Mutex::new(());
@@ -192,10 +259,19 @@ pub fn client_version_ok(payload: &Value) -> bool {
         .is_some_and(|v| v >= FOLLOW_MIN_VERSION)
 }
 
-/// 把 A 端在 `device_attest_context` 里声明的补丁日期落到本机 TEE 上。
+/// 这个值要不要动：和**本机原值**（开机时的真实值）比，一样就不动。
+///
+/// 之所以要拿基线比而不是「当前属性值」：上一次搞脏了（比如还原失败）之后属性已经不
+/// 是本机原值了，拿它当参照会把本该改的回合当成「已经匹配」。
+fn value_matches(_prop: &str, base: &str, want: &str) -> bool {
+    base.trim() == want.trim()
+}
+
+/// 把 A 端在 `device_attest_context` 里声明的版本号/补丁日期落到本机 TEE 上。
 ///
 /// 返回 `Some(说明)` 表示这次真动了属性（并让 HAL 重读了）；`None` 表示不用动——
-/// 开关没开、请求里没带日期、或者本机已经是这个值。
+/// 开关没开、请求里没带、或者**跟本机原值一样**（A 端已经同步成全一致时就是这样，
+/// 这时候不该为了一笔请求去折腾 HAL 和 keystore2）。
 pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
     if !on {
         return None;
@@ -222,6 +298,7 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
     }
 
     let mut applied: Vec<String> = Vec::new();
+    remember_baseline(&[OS_PROP, VENDOR_PROP]);
     for (prop, want) in [(OS_PROP, want_os), (VENDOR_PROP, want_vendor)] {
         let Some(want) = want else { continue };
         let current = match getprop(prop) {
@@ -231,7 +308,12 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
                 continue;
             }
         };
-        if current == want {
+        let base = baseline_value(prop).unwrap_or_else(|| current.clone());
+        // 请求要的就是本机原值 → 不碰属性、不弹 HAL（A 端全同步之后每笔都走这条）。
+        if value_matches(prop, &base, &want) {
+            continue;
+        }
+        if value_matches(prop, &current, &want) {
             continue;
         }
         if let Err(e) = resetprop(prop, &want) {
@@ -270,7 +352,7 @@ pub fn follow_a_side(payload: &Value, on: bool) -> Option<String> {
         }
     };
     Some(format!(
-        "B 端补丁日期跟随 A 端：{}；{note}",
+        "B 端版本/补丁日期跟随 A 端：{}；{note}",
         applied.join(", ")
     ))
 }
@@ -432,6 +514,14 @@ mod tests {
         assert_eq!(vendor_prop_value(20260801).as_deref(), Some("2026-08-01"));
         assert_eq!(os_prop_value(0), None);
         assert_eq!(vendor_prop_value(20261301), None);
+    }
+
+    /// 跟本机原值一样就不动（A 端已经全同步的情况），不一样才动。
+    #[test]
+    fn decides_by_local_original_value() {
+        assert!(value_matches(OS_PROP, "2026-08-01", "2026-08-01"));
+        assert!(!value_matches(OS_PROP, "2026-08-01", "2026-09-01"));
+        assert!(!value_matches(OS_PROP, "2026-08-01", ""));
     }
 
     #[test]

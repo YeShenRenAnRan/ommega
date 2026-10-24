@@ -21,7 +21,7 @@ use pkcs8::DecodePrivateKey;
 use rsa::pkcs1v15::SigningKey as RsaSigningKey;
 use rsa::signature::SignatureEncoding;
 use sha2::Sha256;
-use x509_parser::parse_x509_certificate;
+pub use x509_parser::parse_x509_certificate;
 
 use crate::db::DeviceIdentity;
 
@@ -252,6 +252,11 @@ fn write_auth_list(w: yasna::DERWriter<'_>, p: &AttestationParams) {
         .collect();
     user_auth.sort_unstable();
     user_auth.dedup();
+    // 如实反映 App 的请求：auth-bound key 带 504/505、不带 503，普通 key 只带 503。
+    // server_keybox 模式下签名用的是 keybox 私钥（软件签），不需要 auth token，
+    // 所以这里不能像“给真 TEE 转发”那样把 504/505 抹成 503——抹了就是“证书说
+    // 不要认证”，而 App 明明是 setUserAuthenticationRequired(true) 建的 key，
+    // TrustAttestor 的 user_auth_metadata（bit 35）会直接判异常。
     if user_auth.iter().any(|tag| *tag != 503) {
         user_auth.retain(|tag| *tag != 503);
     }
@@ -924,11 +929,41 @@ pub fn build_attested_chain(
     identity: &DeviceIdentity,
     p: &AttestationParams,
 ) -> anyhow::Result<(String, String)> {
+    build_chain_signed_by(identity, p, None)
+}
+
+/// 服务端密钥层的**委派**：用调用方指定的那把证明密钥（服务端自己存的私钥）签发
+/// 子证书，而不是拿身份自带的签发密钥另起一张。
+///
+/// 返回 `(chain_pem, 新叶子私钥 pem)`：`chain_pem` = [子证书, 父证书, ...CA]，
+/// 与真机 B 端的形状一致，A 端据此校验签发关系。
+pub fn build_attested_chain_with_issuer(
+    identity: &DeviceIdentity,
+    p: &AttestationParams,
+    issuer_key_pem: &str,
+    issuer_chain_pem: &str,
+) -> anyhow::Result<(String, String)> {
+    build_chain_signed_by(identity, p, Some((issuer_key_pem, issuer_chain_pem)))
+}
+
+fn build_chain_signed_by(
+    identity: &DeviceIdentity,
+    p: &AttestationParams,
+    issuer_override: Option<(&str, &str)>,
+) -> anyhow::Result<(String, String)> {
     // 1) Load the stored private key as the ISSUER key.
-    let issuer_key = parse_private_key(identity.private_key_pem_cipher.as_bytes())?;
+    let issuer_key_pem = match issuer_override {
+        Some((key_pem, _)) => key_pem.to_string(),
+        None => identity.private_key_pem_cipher.clone(),
+    };
+    let issuer_chain_pem = match issuer_override {
+        Some((_, chain_pem)) => chain_pem.to_string(),
+        None => identity.certificate_chain_pem.clone(),
+    };
+    let issuer_key = parse_private_key(issuer_key_pem.as_bytes())?;
 
     // 2) Parse the stored certificate chain.
-    let ders = parse_chain_pem(&identity.certificate_chain_pem)?;
+    let ders = parse_chain_pem(&issuer_chain_pem)?;
     if ders.is_empty() {
         anyhow::bail!(
             "empty certificate_chain_pem for device {}",
@@ -1026,9 +1061,18 @@ pub fn build_attested_chain(
     // ATTEST_KEY) get KeyUsage + the attestation extension only; adding
     // CA=false here diverged from real leaves and broke STRONG integrity.
     let ext_value = build_attestation_extension_der(p);
+    // KeyUsage：请求了 ATTEST_KEY（用途枚举值 7）的叶子必须带 keyCertSign ——
+    // AIDL 里写得很死：「keyCertSignBit: iff the attested key has
+    // KeyPurpose::ATTEST_KEY」。没带的话它就不像一张能签发子证书的证明密钥。
+    let is_attest_key = p.purposes.iter().any(|&purpose| purpose == 7);
     let ku_der = {
         let mut d = Der::new();
-        d.bit_string(&[0x80, 0x00]); // digitalSignature
+        if is_attest_key {
+            // bit0 digitalSignature + bit5 keyCertSign
+            d.bit_string(&[0x84, 0x00]);
+        } else {
+            d.bit_string(&[0x80, 0x00]); // digitalSignature
+        }
         d.into_vec()
     };
     let mut exts_content = Der::new();
@@ -3019,14 +3063,12 @@ Xt/5rgIhAKcd9MUqGQDOEBWOSMJT91iefsC+ku4SOVF9MDlUHn32
         assert!(!der.windows(5).any(|w| w == b"nubia"));
     }
 
-    /// A key the app created with `setUserAuthenticationRequired(true)` must be
-    /// attested with `USER_AUTH_TYPE` (504) + `AUTH_TIMEOUT` (505) and *without*
-    /// `NO_AUTH_REQUIRED` (503) — the framework expands that call into 502 + 504 +
-    /// 505, and a leaf claiming "no auth required" is self-contradictory. That
-    /// contradiction is what TrustAttestor reports as
-    /// `hardware.attestation.user_auth_metadata` / `user_auth_policy`. The SID
-    /// (502) must stay out of the leaf: AOSP emits it for `importWrappedKey()`
-    /// only.
+    /// auth-bound key（`setUserAuthenticationRequired(true)`，framework 展开成 502 + 504 +
+    /// 505）必须带 `USER_AUTH_TYPE` (504) + `AUTH_TIMEOUT` (505) 且**不带**
+    /// `NO_AUTH_REQUIRED` (503)：证书说“不要认证”跟 App 的请求直接矛盾，
+    /// TrustAttestor 会报 `hardware.attestation.user_auth_metadata`。
+    /// SID (502) 不进叶证书，只用于 A 端本地校验指纹。
+    /// （server_keybox 模式签名用 keybox 私钥，不需要 auth token，所以带 504/505 不受影响。）
     #[test]
     fn key_description_carries_requested_user_auth_policy() {
         /// Whether the DER contains a context-specific tag `n` (high-tag-number

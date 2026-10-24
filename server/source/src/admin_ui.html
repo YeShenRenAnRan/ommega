@@ -400,6 +400,11 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
         <option value="a">A 端</option>
         <option value="b">B 端</option>
       </select>
+      <select id="tokKind" style="background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 12px;font-size:13px;">
+        <option value="">普通卡（任意互通）</option>
+        <option value="pair">私卡（需配对）</option>
+      </select>
+      <input type="text" id="tokPair" placeholder="配对组（私卡可留空，事后可编辑）" autocapitalize="none" style="min-width:200px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 12px;font-size:13px;">
       <select id="tokDuration" style="background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 12px;font-size:13px;">
         <option value="3600">1 小时</option>
         <option value="21600">6 小时</option>
@@ -418,8 +423,8 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
     </div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>Token</th><th>角色</th><th>有效期</th><th>状态</th><th>激活时间</th><th>最后使用 IP</th><th>最后使用时间</th><th>备注</th><th>操作</th></tr></thead>
-      <tbody id="tokenBody"><tr><td colspan="9" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>Token</th><th>角色</th><th>类型</th><th>配对组</th><th>有效期</th><th>状态</th><th>激活时间</th><th>最后使用 IP</th><th>最后使用时间</th><th>备注</th><th>操作</th></tr></thead>
+      <tbody id="tokenBody"><tr><td colspan="11" class="empty">加载中…</td></tr></tbody>
     </table>
     </div>
     <div class="collapse-bar" id="tokenCollapse" style="display:none" onclick="toggleCollapse('token')">显示全部</div>
@@ -498,13 +503,48 @@ h3.sec-title { font-size: 13px; color: var(--muted); text-transform: uppercase; 
   </div>
 </div>
 
-<!-- 默认设备 id（A 端留空时落到哪台 B） -->
+<!-- 认证层序（排障用：默认「自动」跟随上面那个模式） -->
 <div class="panel">
-  <h2>默认设备 ID <span class="hint">A 端远程模式留空 device_id 时用哪台 B。这里填了就固定落这台；留空则按负载挑一台在线的（A 端模块默认就是留空，不用再占位一台设备）</span></h2>
+  <h2>认证层序 <span class="hint">默认「自动」= 跟随模式：本地出证 → 服务端 keybox 先；A/B 转发 → 真机先。下面两项只有排障时才需要动</span></h2>
   <div class="body">
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">普通认证</span>
+      <select id="apAttestOrder" style="flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+        <option value="auto">自动（跟随模式）</option>
+        <option value="b_first">真机优先</option>
+        <option value="keybox_first">服务端优先</option>
+      </select>
+    </div>
     <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
-      <input id="ddInput" placeholder="device-b-xxxxxxxx（留空 = 按负载挑）" autocapitalize="none"
+      <span style="flex:0 0 104px;color:var(--muted);font-size:13px;">设备 ID 认证</span>
+      <select id="apIdAttestOrder" style="flex:1;min-width:220px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+        <option value="auto">自动（跟随模式）</option>
+        <option value="b_first">真机优先</option>
+        <option value="keybox_first">服务端优先</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
+      <button class="btn primary" onclick="saveAttestPolicy()">保存</button>
+    </div>
+    <p class="hint" id="apStatus" style="margin:12px 0 0;line-height:1.7;">加载中…</p>
+  </div>
+</div>
+
+<!-- 默认设备 id（A 端留空时落到哪台 B，两条链路各一个） -->
+<div class="panel">
+  <h2>默认设备 ID <span class="hint">A 端远程模式留空 device_id 时用哪台 B。两条链路各自独立：KeyMint 链（认证 / 签名 / 解密）用上面那台，SOTER 链用下面那台；留空则各自按负载挑一台在线的。请求自带 device_id 时一律按请求走，不看这里</span></h2>
+  <div class="body">
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+      <span style="flex:0 0 88px;color:var(--muted);font-size:13px;">KeyMint 链</span>
+      <input id="ddKeymint" placeholder="device-b-xxxxxxxx（留空 = 按负载挑）" autocapitalize="none"
              style="flex:1;min-width:240px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+    </div>
+    <div class="token-gen" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+      <span style="flex:0 0 88px;color:var(--muted);font-size:13px;">SOTER 链</span>
+      <input id="ddSoter" placeholder="device-b-xxxxxxxx（留空 = 按负载挑）" autocapitalize="none"
+             style="flex:1;min-width:240px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;">
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
       <button class="btn primary" onclick="saveDefaultDevice()">保存</button>
       <button class="btn" onclick="clearDefaultDevice()">清空</button>
     </div>
@@ -761,16 +801,23 @@ function fmtDuration(sec) {
 
 async function generateToken() {
   const role = $('#tokRole').value;
+  const kind = $('#tokKind').value;
+  const pairId = $('#tokPair').value.trim();
   const duration = parseInt($('#tokDuration').value, 10);
   const note = $('#tokNote').value.trim();
   try {
     const d = await api('/api/admin/tokens/', {
       method: 'POST',
-      body: JSON.stringify({ role, duration_seconds: duration, note })
+      body: JSON.stringify({ role, duration_seconds: duration, note, kind, pair_id: pairId })
     });
     const r = $('#genResult');
     r.style.display = 'block';
-    r.innerHTML = `已生成 ${d.role === 'a' ? 'A 端' : 'B 端'} Token（有效期 ${fmtDuration(d.duration_seconds)}）：<br><b class="mono">${esc(d.token)}</b>`;
+    const kindLabel = kind === 'pair' ? '私卡' : (d.role === 'a' ? '普通 A 端' : '普通 B 端');
+    const pairNote = kind === 'pair'
+      ? `<br>配对组：<b class="mono">${d.pair_id ? esc(d.pair_id) : '（空，可在列表里补）'}</b>`
+      : '';
+    r.innerHTML = `已生成 ${kindLabel} Token（有效期 ${fmtDuration(d.duration_seconds)}）：`
+      + `<br><b class="mono">${esc(d.token)}</b>` + pairNote;
     $('#tokNote').value = '';
     toast('Token 生成成功');
     loadTokens();
@@ -921,6 +968,21 @@ function filterTokens() {
   renderTokens();
 }
 
+function kindTag(kind) {
+  if (kind === 'pair') return '<span class="tag" style="background:rgba(79,124,255,.18);color:#9db8ff;">私卡</span>';
+  return '<span class="muted">普通卡</span>';
+}
+
+async function editPair(id, current) {
+  const v = prompt('配对组（留空 = 不配对；两端相同的配对组才能互通）', current || '');
+  if (v === null) return;
+  try {
+    await api(`/api/admin/tokens/${id}/`, { method: 'POST', body: JSON.stringify({ pair_id: v.trim() }) });
+    toast('配对组已保存');
+    loadTokens();
+  } catch (e) { toast('保存失败: ' + e.message, 'err'); }
+}
+
 function renderTokens() {
   const q = (document.getElementById('tokenSearch').value || '').trim().toLowerCase();
   const filtered = !q ? _tokenData : _tokenData.filter(t =>
@@ -933,7 +995,7 @@ function renderTokens() {
     ? `${filtered.length} / ${_tokenData.length} 条`
     : `${_tokenData.length} 条`;
   if (!filtered.length) {
-    document.getElementById('tokenBody').innerHTML = '<tr><td colspan="9" class="empty">' + (q ? '无匹配 Token' : '暂无 API Token') + '</td></tr>';
+    document.getElementById('tokenBody').innerHTML = '<tr><td colspan="11" class="empty">' + (q ? '无匹配 Token' : '暂无 API Token') + '</td></tr>';
     document.getElementById('tokenCollapse').style.display = 'none';
     return;
   }
@@ -941,6 +1003,11 @@ function renderTokens() {
     <tr>
       <td class="mono">${esc(t.token)}</td>
       <td><span class="tag ${t.role === 'a' ? 'ec' : 'rsa'}">${t.role === 'a' ? 'A 端' : 'B 端'}</span></td>
+      <td>${kindTag(t.kind)}</td>
+      <td class="mono">${t.kind === 'pair'
+        ? (t.pair_id ? esc(t.pair_id) : '<span class="muted">（未设）</span>')
+          + ` <button class="btn small" onclick="editPair(${t.id}, '${esc(t.pair_id || '')}')">改配对组</button>`
+        : '—'}</td>
       <td>${fmtDuration(t.duration_seconds)}</td>
       <td>${t.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">禁用</span>'}</td>
       <td class="mono">${t.activated_at ? fmtTimeStr(t.activated_at) : '未激活'}</td>
@@ -1128,39 +1195,70 @@ async function setStrongboxMode(mode) {
   } catch (e) { toast(e.message, 'err'); loadStrongbox(); }
 }
 
+const ORDER_LABEL = { auto: '自动（跟随模式）', b_first: '真机优先', keybox_first: '服务端优先' };
+
+async function loadAttestPolicy() {
+  try {
+    const d = await api('/api/admin/attest_policy/');
+    $('#apAttestOrder').value = d.attest_order || 'auto';
+    $('#apIdAttestOrder').value = d.id_attest_order || 'auto';
+    const mode = d.mode === 'server_keybox' ? '本地出证（keybox 先）' : 'A/B 转发（真机先）';
+    $('#apStatus').textContent = `当前模式：${mode} · 普通=${ORDER_LABEL[d.attest_order] || d.attest_order} · 设备 ID=${ORDER_LABEL[d.id_attest_order] || d.id_attest_order}`;
+  } catch (e) { $('#apStatus').textContent = '读取失败: ' + e.message; }
+}
+
+async function saveAttestPolicy() {
+  try {
+    await api('/api/admin/attest_policy/', {
+      method: 'POST',
+      body: JSON.stringify({
+        attest_order: $('#apAttestOrder').value,
+        id_attest_order: $('#apIdAttestOrder').value,
+      }),
+    });
+    toast('认证层序已保存（立即生效）');
+    loadAttestPolicy();
+  } catch (e) { toast('保存失败: ' + e.message, 'err'); }
+}
+
 async function loadDefaultDevice() {
   try {
     const d = await api('/api/admin/default_device/');
     const total = d.online_total ?? 0;
-    const cur = d.device_id || '';
-    if (document.activeElement !== $('#ddInput')) $('#ddInput').value = cur;
-    if (!cur) {
-      $('#ddStatus').innerHTML = `未设置：A 端留空的请求会按负载挑一台在线 B（当前在线 ${total} 台）。`;
-    } else if (d.online) {
-      $('#ddStatus').innerHTML = `当前默认：<b>${cur}</b>（在线）。A 端留空的请求优先落这台。`;
-    } else {
-      $('#ddStatus').innerHTML = `当前默认：<b>${cur}</b>（<span style="color:var(--warn,#f5a623)">当前离线</span>）。此时 A 端留空的请求会按负载落到别的在线 B。`;
-    }
+    const k = d.keymint_device_id || '';
+    const s = d.soter_device_id || '';
+    if (document.activeElement !== $('#ddKeymint')) $('#ddKeymint').value = k;
+    if (document.activeElement !== $('#ddSoter')) $('#ddSoter').value = s;
+    const one = (name, id, online) => {
+      if (!id) return `${name}：未设置（按负载挑）`;
+      if (online) return `${name}：<b>${id}</b>（在线）`;
+      return `${name}：<b>${id}</b>（<span style="color:var(--warn,#f5a623)">当前离线</span>）`;
+    };
+    $('#ddStatus').innerHTML = `${one('KeyMint', k, d.keymint_online)}<br>${one('SOTER', s, d.soter_online)}`
+      + `<br><span style="opacity:.7">在线 B 共 ${total} 台；请求自带 device_id 时按请求走，不看这里。</span>`;
   } catch (e) { /* auth handled */ }
 }
 
 async function saveDefaultDevice() {
-  const id = $('#ddInput').value.trim();
+  const keymint = $('#ddKeymint').value.trim();
+  const soter = $('#ddSoter').value.trim();
   try {
-    const d = await api('/api/admin/default_device/', { method: 'POST', body: JSON.stringify({ device_id: id }) });
-    $('#ddInput').value = d.device_id || '';
-    toast(d.device_id ? `默认设备已保存：${d.device_id}` : '已清空：改回按负载挑');
+    const d = await api('/api/admin/default_device/', { method: 'POST', body: JSON.stringify({ keymint_device_id: keymint, soter_device_id: soter }) });
+    $('#ddKeymint').value = d.keymint_device_id || '';
+    $('#ddSoter').value = d.soter_device_id || '';
+    toast(d.keymint_device_id || d.soter_device_id ? '默认设备已保存' : '已清空：两条链都改回按负载挑');
     loadDefaultDevice();
   } catch (e) { toast('保存失败: ' + e.message, 'err'); }
 }
 
 async function clearDefaultDevice() {
-  $('#ddInput').value = '';
+  $('#ddKeymint').value = '';
+  $('#ddSoter').value = '';
   await saveDefaultDevice();
 }
 
 function loadAll() {
-  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadDefaultDevice();
+  loadOverview(); loadDevices(); loadTasks(); loadReports(); loadTokens(); loadAutoKeybox(); loadIpFilter(); loadStrongbox(); loadAttestPolicy(); loadDefaultDevice();
 }
 
 /* Upload */

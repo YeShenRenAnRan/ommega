@@ -16,7 +16,7 @@ done
 sleep 1
 
 echo "=== 3. 清 pid 文件 ==="
-rm -f /data/adb/ommega/relay.pid /data/adb/ommega/relay-daemon.pid
+rm -f /data/adb/ommega-b/run/relay.pid /data/adb/ommega-b/run/relay-daemon.pid
 
 echo "=== 4. 替换为新版 daemon-relay ==="
 cp /data/local/tmp/daemon-relay /data/adb/modules/ommega-b/daemon-relay

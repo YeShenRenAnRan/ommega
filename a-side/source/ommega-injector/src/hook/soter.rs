@@ -182,6 +182,11 @@ fn describe(hal: bool, code: u32) -> Option<(&'static str, Args)> {
             11 => ("initSign", Args::UidAliasChallenge),
             12 => ("removeAllUidKey", Args::Uid),
             13 => ("removeAuthKey", Args::UidAlias),
+            // 产线 provisioning 那三个。原厂 TA 对它们整族回 -20（这台机器没 provisioning），
+            // 而工程模式那页的 SOTER 项就是 14 号 verifyAttkKeyPair —— HIDL 线上是 2 号。
+            2 => ("exportAttkPublicKey", Args::Uid),
+            6 => ("generateAttkKeyPair", Args::Uid),
+            14 => ("verifyAttkKeyPair", Args::None),
             _ => return None,
         })
     } else {

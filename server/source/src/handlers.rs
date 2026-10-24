@@ -252,14 +252,44 @@ async fn try_b_device_layer(
     body: &Value,
     device_id: &str,
     any_b_online: bool,
+    a_meta: Option<&crate::auth::TokenMeta>,
 ) -> Option<Value> {
     if !any_b_online {
         return Some(json!({ "error": "no B-side device online" }));
     }
     let target = state.store.resolve_online_target(device_id).await;
-    // 这台 B 明确说了“这些包我不跟随”（relay.conf 的黑名单，心跳里报上来）：
-    // 连这一跳都不走，直接交给下一层 —— 物理模式下就是服务端 keybox 层。
-    if task_type == "attest" {
+    // 配对校验：`pair` 卡密的 A 只能派给同 `pair_id` 的 B；`public` 卡任意；
+    // 两边有一方是老卡密 / 静态 token / 未登记就按历史行为放行。
+    if let Some(a) = a_meta {
+        let b_meta = state
+            .store
+            .device_token_meta(&target)
+            .await
+            .map(|(pair_id, kind)| crate::auth::TokenMeta {
+                role: "b".to_string(),
+                pair_id,
+                kind,
+            });
+        if let Some(b_meta) = b_meta {
+            if a.kind == "pair" && !a.allows(&b_meta) {
+                tracing::info!(
+                    "b_layer: pair mismatch for {target}: A pair={} B pair={}",
+                    a.pair_id,
+                    b_meta.pair_id
+                );
+                return Some(json!({
+                    "error": "pair mismatch: this A token is not paired with that B token",
+                    "relay_error_kind": "pair_mismatch",
+                }));
+            }
+        }
+    }
+    // B 心跳里报上来的 `skip_pkgs` 原本是「补丁日期不跟随」的名单（relay.conf 的
+    // OMMEGA_RELAY_PATCHLEVEL_SKIP_PKGS），不是「这些包不服务」。以前拿它当派发黑名单，
+    // 结果检测器/微信/QQ 这些包永远到不了真机，一律掉到服务端密钥层 —— 看起来就像
+    // 「远程还是本地伪造」。现在只当补丁跟随用；真要禁止某些包走真机，
+    // 在服务端设 RELAY_DISPATCH_SKIP=1（或干脆维护在 B 端 relay.conf 的 patchlevel 名单里）。
+    if task_type == "attest" && std::env::var("RELAY_DISPATCH_SKIP").as_deref() == Ok("1") {
         let pkg = request_package(body);
         if !pkg.is_empty() {
             let skip = state.store.skip_pkgs_for(&target).await;
@@ -508,6 +538,7 @@ async fn run_smart_strongbox_attest(
     device_id: &str,
     body: &Value,
     any_b_online: bool,
+    a_meta: Option<&crate::auth::TokenMeta>,
 ) -> Response {
     let serverbox = state.fulfill.is_enabled();
     let task_type = "attest";
@@ -524,7 +555,7 @@ async fn run_smart_strongbox_attest(
     }
 
     if any_b_online {
-        if let Some(v) = try_b_device_layer(state, task_type, body, device_id, true).await {
+        if let Some(v) = try_b_device_layer(state, task_type, body, device_id, true, a_meta).await {
             if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
                 // Only a chain that is itself StrongBox-tagged counts as the B
                 // device fulfilling the StrongBox request.  The b-app relay goes
@@ -611,11 +642,14 @@ async fn run_refuse_strongbox_attest(
     device_id: &str,
     body: &Value,
     any_b_online: bool,
+    a_meta: Option<&crate::auth::TokenMeta>,
 ) -> Response {
     let task_type = "attest";
 
     // Only the B device's own StrongBox can answer in this mode.
-    if let Some(v) = try_b_device_layer(state, task_type, body, device_id, any_b_online).await {
+    if let Some(v) =
+        try_b_device_layer(state, task_type, body, device_id, any_b_online, a_meta).await
+    {
         if v.get("error").is_none() && !attest_chain_empty(task_type, &v) {
             let level = chain_attestation_security_level(&v);
             if level == Some(2) {
@@ -683,13 +717,74 @@ fn refuse_strongbox_body(kind: &str, msg: &str) -> Response {
 /// A layer "succeeds" when it returns a result without an `error` field;
 /// otherwise the next layer is tried, and only when every layer fails is an
 /// error returned.
-async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Response {
+/// `RELAY_ATTEST_KEYBOX_FIRST=1`（或控制台策略开关）时 attest 回到「服务端密钥层优先」。
+///
+/// 默认（不开）= 跟随模式：本地出证模式 → 服务端 keybox 先；物理模式 → 真机先。
+/// 策略值在 [`crate::attest_policy`] 里（三态：auto / b_first / keybox_first，
+/// 运行时可变 + 落盘），层序选择见 [`attest_layer_order`]。
+///
+/// 这个请求带没带设备 ID（看 A 端转过来的 `attestation_ids`）。
+/// A 端只在应用真要求 ID 证明时才放这个字段，所以「有」就是「这次要 ID」。
+fn request_has_attestation_ids(body: &Value) -> bool {
+    for holder in [
+        body,
+        body.get("device_attest_context").unwrap_or(&Value::Null),
+    ] {
+        if let Some(ids) = holder.get("attestation_ids") {
+            if ids.as_array().is_some_and(|a| !a.is_empty()) {
+                return true;
+            }
+            if ids.as_object().is_some_and(|o| !o.is_empty()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 选这次请求的层序。
+///
+/// 默认（`auto`）**只看模式**：
+/// - 本地出证（`RELAY_ATTEST_SOURCE=server_keybox`）→ `keybox → b → self_signed`
+/// - 物理模式（`physical`）                  → `b → keybox → self_signed`
+///
+/// 两个策略（普通 / 带设备 ID）都是三态，`auto` 时完全不介入；只有排障时才会被
+/// 强制成 `b_first` 或 `keybox_first`。
+fn attest_layer_order(task_type: &str, body: &Value, serverbox: bool) -> &'static [&'static str] {
+    const B_CHAIN: &[&str] = &["b", "keybox", "self_signed"];
+    const KB_CHAIN: &[&str] = &["keybox", "b", "self_signed"];
+    // 强制模式是「只用这一层」：出不来就把错误抛回去，不回退。能回退的话就跟
+    // 模式自动分层没区别了，调试时也看不出到底是哪一层出的链。
+    const ONLY_B: &[&str] = &["b"];
+    const ONLY_KB: &[&str] = &["keybox"];
+    let by_mode = if serverbox { KB_CHAIN } else { B_CHAIN };
+    if task_type != "attest" {
+        return by_mode;
+    }
+    let policy = if request_has_attestation_ids(body) {
+        crate::attest_policy::id_attest_order()
+    } else {
+        crate::attest_policy::attest_order()
+    };
+    match policy {
+        crate::attest_policy::Order::Auto => by_mode,
+        crate::attest_policy::Order::BFirst => ONLY_B,
+        crate::attest_policy::Order::KeyboxFirst => ONLY_KB,
+    }
+}
+
+async fn run_a_side_task(
+    state: &AppState,
+    task_type: &str,
+    body: &Value,
+    a_meta: Option<crate::auth::TokenMeta>,
+) -> Response {
     // A 端远程模式默认不带 `device_id`（模块装好就是留空，面板也不再占位一台设备）。
     // 留空 = 「服务端挑一台」：这里在入口一次归一（控制台配的默认设备），然后整条链
     // 路——physical / serverbox 两种模式的层序、StrongBox 分流、身份查找、队列派发——
     // 看见的都是同一台具体设备，跟「A 端自己带了这个 id」一字不差。没配默认设备就
     // 保持空，由 `resolve_online_target("")` 按负载挑一台在线的 B。
-    let body = crate::default_device::fill_in_body(body);
+    let body = crate::default_device::fill_in_body(crate::default_device::Chain::Keymint, body);
     let body = &body;
     let device_id = body
         .get("device_id")
@@ -747,7 +842,8 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
         && crate::strongbox::mode() == crate::strongbox::StrongboxMode::Smart
         && is_strongbox_request(body)
     {
-        return run_smart_strongbox_attest(state, &device_id, body, any_b_online).await;
+        return run_smart_strongbox_attest(state, &device_id, body, any_b_online, a_meta.as_ref())
+            .await;
     }
 
     // Refuse mode: a StrongBox request gets the serving device's real StrongBox
@@ -757,7 +853,8 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
         && crate::strongbox::mode() == crate::strongbox::StrongboxMode::Refuse
         && is_strongbox_request(body)
     {
-        return run_refuse_strongbox_attest(state, &device_id, body, any_b_online).await;
+        return run_refuse_strongbox_attest(state, &device_id, body, any_b_online, a_meta.as_ref())
+            .await;
     }
 
     let serverbox = state.fulfill.is_enabled();
@@ -770,11 +867,18 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
     //     device has none it returns an error and the next layer is attempted.
     // Only when every layer fails does the request error, letting the A-side
     // fall back to its local software keybox.
-    let order: &[&str] = if serverbox {
-        &["keybox", "b", "self_signed"]
-    } else {
-        &["b", "keybox", "self_signed"]
-    };
+    // 远程 attested 链只要真机在线就先让真机出：`attest` 的层序固定 B 端设备优先，
+    // 不管物理模式还是 serverbox 模式。
+    //
+    // 理由：serverbox 模式的密钥层用的是服务端存的身份（往往是别的机器，甚至是
+    // 管理台上传的占位身份），叶子上的 device properties 又是调用方的，两者拼在
+    // 一起就是一张四不像的链 —— 调用方想看的「真机可信证明」也没了。所以这一层
+    // 只在真机不可用（离线 / 没有这个 alias / StrongBox 不支）时当兜底。
+    // sign/decrypt 等其它请求仍按模式层序（否则会和已铸出的 keyblob 对不上）：
+    // 真机铸的 alias 在密钥层没有 session，会自然落到 B 那层。
+    // 层序：默认跟随模式（本地出证 → keybox 先；物理 → 真机先），两个策略开关只在
+    // 排障时强制换一下。`auto` 时没有任何特判。
+    let order: &[&str] = attest_layer_order(task_type, body, serverbox);
 
     let mut last_error: Option<String> = None;
     // 第一处「这台设备根本没有这个 alias 的私钥」的原因，原样带到最终错误里。
@@ -787,7 +891,17 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
     let mut blacklist_hit = false;
     for &layer in order {
         let result = match layer {
-            "b" => try_b_device_layer(state, task_type, body, &device_id, any_b_online).await,
+            "b" => {
+                try_b_device_layer(
+                    state,
+                    task_type,
+                    body,
+                    &device_id,
+                    any_b_online,
+                    a_meta.as_ref(),
+                )
+                .await
+            }
             "keybox" => run_layer_keybox(state, task_type, body, &device_id, blacklist_hit).await,
             "self_signed" => run_layer_self_signed(state, task_type, body, &device_id).await,
             _ => None,
@@ -802,6 +916,15 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
                 return Json(v).into_response();
             }
             Some(v) => {
+                // 层自带的「确定答复」：带 relay_error_kind 的不再往下层试，直接交给 A。
+                // （服务端密钥层找不到调用方那把证明密钥时就是这种：换层只会让链跟那把
+                // 钥匙彻底无关，A 收到标记后映射成 InvalidKeyBlob 让应用重建。）
+                if let Some(kind) = v.get("relay_error_kind").and_then(Value::as_str) {
+                    tracing::info!(
+                        "run_a_side_task: type={task_type} layer={layer} definitive error kind={kind}"
+                    );
+                    return Json(v).into_response();
+                }
                 // 失败原因交给 `layer_failure_msg`：各层回的 `error` 优先，只有它
                 // 没给原因时才说空链。`device` 是 *请求的* 设备 —— 正上方的
                 // `b_poll` 行会显示实际接管的是哪一台。
@@ -824,9 +947,15 @@ async fn run_a_side_task(state: &AppState, task_type: &str, body: &Value) -> Res
                     && is_strongbox_request(body)
                 {
                     let demoted = demote_to_tee(body);
-                    if let Some(dv) =
-                        try_b_device_layer(state, task_type, &demoted, &device_id, any_b_online)
-                            .await
+                    if let Some(dv) = try_b_device_layer(
+                        state,
+                        task_type,
+                        &demoted,
+                        &device_id,
+                        any_b_online,
+                        a_meta.as_ref(),
+                    )
+                    .await
                     {
                         if dv.get("error").is_none() && !attest_chain_empty(task_type, &dv) {
                             tracing::info!(
@@ -1002,7 +1131,13 @@ pub async fn attest(
     if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
-    run_a_side_task(&state, "attest", &body).await
+    run_a_side_task(
+        &state,
+        "attest",
+        &body,
+        state.auth.token_meta(token_from_headers(&headers)),
+    )
+    .await
 }
 
 pub async fn sign(
@@ -1013,7 +1148,13 @@ pub async fn sign(
     if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
-    run_a_side_task(&state, "sign", &body).await
+    run_a_side_task(
+        &state,
+        "sign",
+        &body,
+        state.auth.token_meta(token_from_headers(&headers)),
+    )
+    .await
 }
 
 pub async fn decrypt(
@@ -1024,7 +1165,13 @@ pub async fn decrypt(
     if let Err(r) = check_auth(&state, &headers, Some("a")).await {
         return *r;
     }
-    run_a_side_task(&state, "decrypt", &body).await
+    run_a_side_task(
+        &state,
+        "decrypt",
+        &body,
+        state.auth.token_meta(token_from_headers(&headers)),
+    )
+    .await
 }
 
 /// POST /api/soter/ — SOTER 转发的入口，鉴权后交给 `run_soter_task`。
@@ -1044,7 +1191,7 @@ pub async fn soter(
 async fn run_soter_task(state: &AppState, body: &Value) -> Response {
     // 同一台 B 的 SOTER 请求排队执行（见 `soter_device_guard`）。设备 ID 在这里就归一：
     // A 端留空 + 配了默认设备 = 等同于它带了那个 id，跟 inner 一个口径。
-    let filled = crate::default_device::fill_in_body(body);
+    let filled = crate::default_device::fill_in_body(crate::default_device::Chain::Soter, body);
     let device = filled
         .get("device_id")
         .and_then(Value::as_str)
@@ -1311,10 +1458,57 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     if !body.is_object() {
         return json_err(StatusCode::BAD_REQUEST, "json object body required");
     }
+    // 入口闸门：同一个 uid 在 100ms 内重复来的 SOTER 请求直接回「本地作答」，
+    // 不再走后面的默认设备归一、会话路由和 DB。
+    //
+    // 为什么：探测机（春秋 / 鸭子）一刻不停地刷 SOTER，实测量级每秒几十笔，
+    // 每一笔都要过一遍路由 + 会话库，服务端 CPU 和 MySQL 被它吃掉，买卡页跟着变慢。
+    // 它们要的结论是固定的（local_only），100ms 内复用没有副作用；真应用（微信 /
+    // 支付宝）正常流程不会在同一 uid 上 100ms 内发第二笔，不受影响。
+    if let Some(uid) = body.get("uid").and_then(Value::as_i64) {
+        // 真应用不过这道闸门。
+        //
+        // 闸门是为了探测机（春秋 / 鸭子，每秒几十笔）省 CPU 的；可它们要的结论是
+        // 固定的 local_only。真应用一轮流程里 ASK / generateAuthKey / export 的
+        // 间隔经常不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」——两边的
+        // cpu_id 和钥匙对不上，检测器 C5b（两次 cpuid 不一致）和 T10（建了导不出）
+        // 就是这么红的。所以先看名单，真应用直接放过去走正常路由。
+        let caller_pkg = body
+            .get(crate::soter_probe::CALLER_PKG_FIELD)
+            .and_then(Value::as_str);
+        if !crate::soter_probe::is_listed_real_app(&state.cfg, caller_pkg) {
+            use std::sync::{LazyLock, Mutex};
+            const GATE_MS: u64 = 100;
+            static LAST_BY_UID: LazyLock<Mutex<std::collections::HashMap<i64, u64>>> =
+                LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if let Ok(mut gate) = LAST_BY_UID.lock() {
+                let too_soon = gate
+                    .get(&uid)
+                    .is_some_and(|prev| now.saturating_sub(*prev) < GATE_MS);
+                if too_soon {
+                    let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
+                    return Json(json!({
+                        "op": op,
+                        "local_only": true,
+                        "error_code": -1001,
+                    }))
+                    .into_response();
+                }
+                if gate.len() > 4096 {
+                    gate.clear();
+                }
+                gate.insert(uid, now);
+            }
+        }
+    }
     // 跟 attest 一个口径，而且同样在入口归一：A 端留空 + 配了默认设备 = 等同于
     // 它带了那个 id，SOTER 的探测判据、槽位钉子、签名会话路由、写操作跨设备拦截
     // 看见的 `requested` 都是同一台具体设备。
-    let body = crate::default_device::fill_in_body(body);
+    let body = crate::default_device::fill_in_body(crate::default_device::Chain::Soter, body);
     let body = &body;
     let requested = body.get("device_id").and_then(Value::as_str).unwrap_or("");
     let op = body.get("op").and_then(Value::as_str).unwrap_or("probe");
@@ -1361,6 +1555,8 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     } else {
         false
     };
+    let session_present =
+        op == "finish_sign" && body.get("session").and_then(Value::as_i64).is_some();
     if let Some(why) = crate::soter_probe::reason_with_caller(
         &state.cfg,
         requested,
@@ -1373,21 +1569,30 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     )
     .or_else(|| forced_local.then(|| "这轮会话是内置料上开的".to_string()))
     {
-        // 白名单外（检测器一类）：**不造料**，直接告诉 A 端「这笔你自己本地答」。
-        // 造料要现签名，几十台检测器一起刷就把 CPU 占满，真应用的请求只能排队；
-        // 退回 A 端本地后，工作负载分散到各台手机上，服务端只负责转发真应用。
-        // 旧 A 端不认识 `local_only`，会当成「答复形状不认识」放给真 HAL，
-        // 也就是本地能答就答 —— 方向一致，不会把人卡住。
-        tracing::info!(
-            "soter: op={op} uid={probe_uid} alias={probe_alias} 探测机（{why}）\
+        // 能改设备的身份类 op、以及带着会话号的 finishSign，不吃这套。
+        //
+        // `get_device_id` 本身没有 uid 参数，`finish_sign` 只带 session —— 它们翻不出
+        // 调用方包名，只能拿「当前前台应用」凑，前台不是它自己就变成探测机。而它们的
+        // 料在 B 上（ASK 是 B 签的、session 是 B 建的），退回本地只会拿到另一份：
+        // getDeviceId 回 A 的 cpu_id（C5b 对不上）、finishSign 本地没这张会话（T12 报错）。
+        // 所以这两个直接接下去走正常的设备路由。
+        if !soter_identity_op(op) && !session_present {
+            // 白名单外（检测器一类）：**不造料**，直接告诉 A 端「这笔你自己本地答」。
+            // 造料要现签名，几十台检测器一起刷就把 CPU 占满，真应用的请求只能排队；
+            // 退回 A 端本地后，工作负载分散到各台手机上，服务端只负责转发真应用。
+            // 旧 A 端不认识 `local_only`，会当成「答复形状不认识」放给真 HAL，
+            // 也就是本地能答就答 —— 方向一致，不会把人卡住。
+            tracing::info!(
+                "soter: op={op} uid={probe_uid} alias={probe_alias} 探测机（{why}）\
              直接退回 A 端本地作答，不造料、不落 B"
-        );
-        return Json(json!({
-            "op": op,
-            "local_only": true,
-            "error_code": -1001,
-        }))
-        .into_response();
+            );
+            return Json(json!({
+                "op": op,
+                "local_only": true,
+                "error_code": -1001,
+            }))
+            .into_response();
+        }
     }
 
     let gate_uid = body.get("uid").and_then(Value::as_i64).map(|v| v as i32);
@@ -1430,8 +1635,6 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     } else {
         None
     };
-    let session_present =
-        op == "finish_sign" && body.get("session").and_then(Value::as_i64).is_some();
     // A recorded (requested device, integer session) route is authoritative.
     // Do not let a newly-online requested device override it: the same numeric
     // handle can refer to a different TA session on another B device.
@@ -1523,9 +1726,25 @@ async fn run_soter_task_inner(state: &AppState, body: &Value) -> Response {
     // 连「一台能接的设备都没有」（点名那台离线、或者服务端刚重启还没学到谁在线）
     // 也算接不了：那种情况下照样判「结果未知」，App 拿到的 -1000 比确定的答复难处理。
     //
+    // 但「点名那台离线、服务端已经给它登记了一台替代设备」是例外：那台替代是粘滞的
+    // （`soter_substitutes`，同一台 requested 在 TTL 内一直映射到同一台），而且签名
+    // 类已经限定为「实测真签过」（`soter_sign`）的设备。不让写操作跟过去，默认设备
+    // 一离线微信就整族失败（2026-10-22 实测：设备离线 → 建 ASK 全被拒 → 微信「系统错误」）。
+    //
     // 回什么见 `soter_off_target_reply`：写操作回 -5（这把钥匙不在这台，去原地重建），
     // 要签名的回 -204（会话不在这台，就是 App 自己也会算出来的那个 `OPERATEID_NULL`）。
-    if soter_mutation_cross_served(op, requested, b_target.as_deref(), session_present) {
+    let substituted = if b_target.as_deref() != Some(requested) && !requested.is_empty() {
+        state.store.soter_substitute_of(requested).await.as_deref() == b_target.as_deref()
+    } else {
+        false
+    };
+    if soter_mutation_cross_served(
+        op,
+        requested,
+        b_target.as_deref(),
+        session_present,
+        substituted,
+    ) {
         tracing::warn!(
             "soter: op={op} uid={probe_uid} 点名设备 {requested} 这会儿接不了这笔写操作\
              （b_target={:?} requested_online={requested_online}），不换设备、不落兜底层",
@@ -1993,11 +2212,13 @@ fn soter_mutation_cross_served(
     requested: &str,
     b_target: Option<&str>,
     session_routed: bool,
+    substituted: bool,
 ) -> bool {
     !requested.is_empty()
         && !session_routed
         && soter_op_is_mutation(op)
         && b_target != Some(requested)
+        && !substituted
 }
 
 /// 保留在线点名设备以及已知会话的原设备；不能接活时由原回退层处理，不能换身份。
@@ -2433,6 +2654,19 @@ pub struct PollQuery {
     /// relay 自己的版本号（模块版本，例如 `1.7.0`）。缺失 = 老版本 relay 没上报。
     /// 状态页拿它显示，A 端「留空自己获取」拿它按版本挑设备。
     pub ver: Option<String>,
+    // ---- 本机设备身份（relay 心跳额外上报的那几项）----
+    // A 端「伪装参数 → 从服务器同步」拿这几项去 resetprop，把本机属性对齐到这台 B。
+    // 全部可缺，缺了就不覆盖上次记下的值。
+    pub brand: Option<String>,
+    /// `ro.product.device`（跟 `product` 分开叫，避免和 `product` 混淆）。
+    pub product_device: Option<String>,
+    /// `ro.product.name`。
+    pub product: Option<String>,
+    pub manufacturer: Option<String>,
+    pub product_model: Option<String>,
+    pub serial: Option<String>,
+    /// `ro.build.fingerprint`（整条指纹，很长，单独一项）。
+    pub fingerprint: Option<String>,
 }
 
 pub async fn b_poll(
@@ -2445,6 +2679,13 @@ pub async fn b_poll(
     }
     if q.device_id.is_empty() {
         return json_err(StatusCode::BAD_REQUEST, "device_id required");
+    }
+    // 记下这台用的是哪种 token（配对 / 公开 / 老卡密），给 A 侧的配对校验用。
+    if let Some(meta) = state.auth.token_meta(token_from_headers(&headers)) {
+        state
+            .store
+            .set_device_token_meta(&q.device_id, &meta.pair_id, &meta.kind)
+            .await;
     }
     let machine_id = q.machine_id.unwrap_or_default();
 
@@ -2481,6 +2722,24 @@ pub async fn b_poll(
     state
         .store
         .set_device_from_module(&q.device_id, q.skip_pkgs.is_some() || q.ver.is_some())
+        .await;
+
+    // 本机设备身份（brand/device/product/manufacturer/model/serial）：A 端「伪装参数 →
+    // 从服务器同步」要用它，否则链是真机出的、本机属性还是调用方那台，两边对不上。
+    state
+        .store
+        .set_device_identity(
+            &q.device_id,
+            crate::queue::DeviceIdentityReport {
+                brand: q.brand.clone(),
+                device: q.product_device.clone(),
+                product: q.product.clone(),
+                manufacturer: q.manufacturer.clone(),
+                model: q.product_model.clone(),
+                serial: q.serial.clone(),
+                fingerprint: q.fingerprint.clone(),
+            },
+        )
         .await;
 
     match state
@@ -2979,12 +3238,14 @@ mod soter_device_layer_tests {
             "generate_auth_key_pair",
             "device-b-a",
             Some("device-b-b"),
+            false,
             false
         ));
         assert!(soter_mutation_cross_served(
             "init_sign",
             "device-b-a",
             Some("device-b-b"),
+            false,
             false
         ));
         // 派给点名那台才算数：别的设备、乃至一台都没派出去（点名那台离线 / 服务端
@@ -2993,12 +3254,14 @@ mod soter_device_layer_tests {
             "generate_auth_key_pair",
             "device-b-a",
             Some("device-b-a"),
+            false,
             false
         ));
         assert!(soter_mutation_cross_served(
             "remove_auth_key",
             "device-b-a",
             None,
+            false,
             false
         ));
         // 读操作照旧可以换设备（ASK 身份类另有 `soter_identity_op` 那条）。
@@ -3006,6 +3269,7 @@ mod soter_device_layer_tests {
             "has_auth_key",
             "device-b-a",
             Some("device-b-b"),
+            false,
             false
         ));
         // `finish_sign` 带会话时按会话记的设备走，那不算顶替。
@@ -3013,13 +3277,15 @@ mod soter_device_layer_tests {
             "finish_sign",
             "device-b-a",
             Some("device-b-b"),
-            true
+            true,
+            false
         ));
         // 配置里根本没写设备 id 的老客户端：没法点名，按原样放行。
         assert!(!soter_mutation_cross_served(
             "generate_ask_key_pair",
             "",
             Some("device-b-b"),
+            false,
             false
         ));
     }

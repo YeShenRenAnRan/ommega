@@ -129,7 +129,7 @@ static WEDGE_UNRESOLVED: Mutex<bool> = Mutex::new(false);
 /// 自动重启的记账文件。**必须落盘**：重启会把内存清空，只有文件能跨重启记住
 /// 「今天已经重启过几次」，否则 24 小时上限形同虚设。
 fn reboot_log_path() -> PathBuf {
-    PathBuf::from("/data/adb/ommega/self-reboot.log")
+    PathBuf::from("/data/adb/ommega-b/logs/self-reboot.log")
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use log::{error, info, warn, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use nix::unistd::Pid;
 
 pub mod config;
@@ -35,8 +35,11 @@ const SOTER_HOST_PROCESS: &str = "com.tencent.soter.soterserver";
 /// `vendor.xiaomi.hardware.soterservice@1.0-service`。一个都没匹配上也不当事 ——
 /// 宿主那条路（app → 宿主 → HAL）本来就在宿主进程里，这条只为了 `service call` 那种
 /// 绕开宿主直接打 HAL 的流量。
-const SOTER_HAL_PROCESSES: [&str; 4] = [
+const SOTER_HAL_PROCESSES: [&str; 5] = [
     "vendor.qti.hardware.soter-service",
+    // 高通的 HIDL 版：进程名带 `@1.0`，跟上面那个不带版本的 AIDL 服务并存于不同
+    // 平台。PGP110 / Android 15 就是这种（vendor_hal_soter_qti 域）。
+    "vendor.qti.hardware.soter@1.0-service",
     "vendor.trustonic.soter@1.0-service",
     "vendor.xiaomi.hardware.soterservice@1.0-service",
     "vendor.microtrust.hardware.soter@1.0-service",
@@ -126,56 +129,225 @@ fn soter_selfcheck_transact(service: &str, interface: &str) -> anyhow::Result<i3
         .map_err(|error| anyhow::anyhow!(error))
 }
 
-/// 按进程名找一个目标、把 payload 注进去，顺带把它的身份打进日志。
-fn inject_named_process(name: &str) -> anyhow::Result<()> {
-    let (pid, target_path) = utils::find_process_by_name(name)?;
-    match utils::executable_identity(&target_path) {
-        Ok(identity) => info!(
-            "{name} target pid={} exe={} sha256={} elf={}",
-            pid,
-            identity.path.display(),
-            identity.sha256,
-            identity.elf,
-        ),
-        Err(error) => error!(
-            "failed to describe {name} executable {}: {:#}",
-            target_path.display(),
-            error
-        ),
+/// 扫 `/proc` 找 SOTER HAL 进程：cmdline 里含 `soter`、但不是腾讯的宿主进程。
+///
+/// HAL 进程名各家不一样（`vendor.qti.hardware.soter-service`、
+/// `vendor.qti.hardware.soter@1.0-service`、`vendor.trustonic.soter@1.0-service`……），
+/// 靠硬编码列表总有遗漏。这里直接按实际在跑的进程认，认出来的名字拿去走
+/// `inject_named_process`，跟硬编码列表里那些名字是同一套比对逻辑。
+fn discover_soter_hal_processes() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&raw).replace('\0', " ");
+        let lower = text.to_ascii_lowercase();
+        // 含 soter，但排除三类自己人：
+        //   soterserver —— 腾讯那个宿主（`SOTER_HOST_PROCESS`，上面已经单独注了）
+        //   soterta-serve / soterta-ta —— 我们自己的守护（cmdline 也带 soter，
+        //     不排掉就会把自己当成 HAL 目标去注，实测会拦下）
+        if !lower.contains("soter")
+            || lower.contains("soterserver")
+            || lower.contains("soterta-serve")
+            || lower.contains("soterta-ta")
+            || lower.contains("ommega-inject")
+        {
+            continue;
+        }
+        let Some(name) = utils::process_name(pid) else {
+            continue;
+        };
+        // 光看名字带 soter 不够：检测器自己的包名就带（`com.andrealyz.soterchecker`
+        // 实测被当成 HAL 注了）。HAL 必须真是 vendor 侧的：进程名以 `vendor.` 开头，
+        // 或者可执行文件落在 /vendor /odm /system_ext 下面。
+        let is_vendor_side = name.starts_with("vendor.") || {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map(|path| {
+                    let path = path.to_string_lossy();
+                    path.contains("/vendor/")
+                        || path.contains("/odm/")
+                        || path.contains("/system_ext/")
+                })
+                .unwrap_or(false)
+        };
+        if !is_vendor_side {
+            continue;
+        }
+        if !names.iter().any(|seen| seen == &name) {
+            debug!("discovered soter hal process: {name} (pid={pid})");
+            names.push(name);
+        }
     }
-
-    if payload_thread_present(pid) {
-        info!("{name} target pid={pid} already carries the payload; skipping injection");
-        return Ok(());
-    }
-
-    inject::inject_library(Pid::from_raw(pid))
+    names
 }
 
-/// 诊断用：只注其中几个目标，逗号分隔（`keystore2` / `soter`），`all` 或没设就是两个都注。
-/// 认不出来的名字当作进程名，额外再注一份 —— 临时目标不用为了它改代码。进程名按原样
-/// 用（只会拿去比对），所以这里先把整个值折成小写只是为了 keystore2 / soter 那两个词。
-/// 平时不设这个变量，行为跟以前一样。
-fn selected_targets() -> (bool, bool, Vec<String>) {
+/// 会直接调 `vendor.qti.hardware.soter@1.0::ISoter` 的厂商侧进程。
+///
+/// 一加的 `vendor.oplus.hardware.cryptoeng@1.0-service` 就是这种：工程模式那页的
+/// SOTER key 走 cryptoeng → HIDL soter，进程名里根本没有 "soter"，
+/// `SOTER_HAL_PROCESSES` 和那套动态发现都碰不到它。静态名单兜一档，再按「加载了
+/// soter 的 HIDL 客户端库」扫一遍 hw 目录下的进程，别的机型换了名字也能认。
+const SOTER_HIDL_CLIENT_PROCESSES: [&str; 1] = ["vendor.oplus.hardware.cryptoeng@1.0-service"];
+
+/// 扫 /proc 找「加载了 soter HIDL 客户端库」的厂商进程。
+///
+/// 只认 `/bin/hw/` 下的可执行文件：cryptoeng 这类 HAL/产线工具都在那儿，量小，
+/// 不用把满机器 app 的 maps 都读一遍。名字带 soter 的（原厂 HAL 自己）跳过 ——
+/// 那是服务端，上面 HAL 那一路已经注过了。
+fn discover_soter_hidl_clients() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            continue;
+        };
+        let exe = exe.to_string_lossy().to_ascii_lowercase();
+        if !exe.contains("/bin/hw/") {
+            continue;
+        }
+        let Some(name) = utils::process_name(pid) else {
+            continue;
+        };
+        if name.contains("soter") || name.contains("ommega") {
+            continue;
+        }
+        let Ok(maps) = std::fs::read_to_string(format!("/proc/{pid}/maps")) else {
+            continue;
+        };
+        let maps = maps.to_ascii_lowercase();
+        if !maps.contains("soter@1.0.so") && !maps.contains("soter-1.0.so") {
+            continue;
+        }
+        if !names.iter().any(|seen| seen == &name) {
+            debug!("discovered soter hidl client: {name} (pid={pid})");
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// 把 HIDL soter 客户端全注一遍。注不进去只记日志 —— 这一路只影响厂内工具，
+/// 不能让 keystore2 那条主路受牵连。
+fn inject_soter_hidl_clients() {
+    let mut targets = discover_soter_hidl_clients();
+    for name in SOTER_HIDL_CLIENT_PROCESSES {
+        if !targets.iter().any(|seen| seen == name) {
+            targets.push(name.to_string());
+        }
+    }
+    if !targets.is_empty() {
+        info!("soter hidl client targets: {targets:?}");
+    }
+    for name in &targets {
+        match inject_named_process(name) {
+            Ok(()) => info!("soter hidl client injection completed ({name})"),
+            Err(e) => info!("soter hidl client injection skipped ({name}): {e:#}"),
+        }
+    }
+}
+
+/// 按进程名找目标、把 payload 注进去，顺带把它的身份打进日志。
+///
+/// 同名进程不止一个时每一个都注：多用户 / 分身会让 soterserver 起两份实例
+/// （2026-10-22 魅族 20 Pro 上 u999 与 system 各一个），客户端只认自己那个 uid
+/// 的实例，少注一个就是白干。
+fn inject_named_process(name: &str) -> anyhow::Result<()> {
+    let targets = utils::find_processes_by_name(name)?;
+    let mut injected = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for (pid, target_path) in targets {
+        match utils::executable_identity(&target_path) {
+            Ok(identity) => info!(
+                "{name} target pid={} exe={} sha256={} elf={}",
+                pid,
+                identity.path.display(),
+                identity.sha256,
+                identity.elf,
+            ),
+            Err(error) => error!(
+                "failed to describe {name} executable {}: {:#}",
+                target_path.display(),
+                error
+            ),
+        }
+
+        if payload_thread_present(pid) {
+            info!("{name} target pid={pid} already carries the payload; skipping injection");
+            injected += 1;
+            continue;
+        }
+
+        match inject::inject_library(Pid::from_raw(pid)) {
+            Ok(()) => {
+                info!("{name} target pid={pid} injected");
+                injected += 1;
+            }
+            Err(error) => {
+                error!("{name} target pid={pid} injection failed: {error:#}");
+                failures.push(format!("{pid}: {error:#}"));
+            }
+        }
+    }
+    if injected == 0 {
+        anyhow::bail!("every {name} instance failed: {}", failures.join("; "));
+    }
+    if !failures.is_empty() {
+        warn!(
+            "{name}: {} instance(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// 诊断用：只注其中几个目标，逗号分隔（`keystore2` / `soter` / `soter-hidl`），`all` 或没设
+/// 就是全都注。认不出来的名字当作进程名，额外再注一份 —— 临时目标不用为了它改代码。
+fn selected_targets() -> (bool, bool, bool, Vec<String>) {
     let Ok(value) = std::env::var("OMMEGA_INJECT_TARGETS") else {
-        return (true, true, Vec::new());
+        return (true, true, true, Vec::new());
     };
     let value = value.to_ascii_lowercase();
     if value.trim() == "all" {
-        return (true, true, Vec::new());
+        return (true, true, true, Vec::new());
     }
     let mut extras = Vec::new();
     let mut keystore2 = false;
     let mut soter = false;
+    let mut soter_hidl = false;
     for item in value.split(',') {
         match item.trim() {
             "" => {}
             "keystore2" => keystore2 = true,
             "soter" => soter = true,
+            "soter-hidl" => soter_hidl = true,
             name => extras.push(name.to_string()),
         }
     }
-    (keystore2, soter, extras)
+    (keystore2, soter, soter_hidl, extras)
 }
 
 fn log_runtime_identity(role: &str) {
@@ -219,6 +391,28 @@ fn main() {
             }
         }
     }
+    // 只读探针：对着真实 SOTER HAL 打一次 getDeviceId，把回复的前几个字段打出来。
+    // 没有工程模式页的机器（NX809J 那种）就靠它看 HAL 到底能不能用、我们回的字节对不对。
+    if std::env::args().any(|arg| arg == "--soter-probe") {
+        logging::init_logger_fallback(LevelFilter::Debug);
+        let mut services: Vec<String> = SOTER_HAL_CANDIDATES
+            .iter()
+            .map(|(service, _)| service.to_string())
+            .collect();
+        if let Ok(extra) = std::env::var("OMMEGA_SOTER_SERVICE") {
+            let extra = extra.trim().to_string();
+            if !extra.is_empty() && !services.contains(&extra) {
+                services.push(extra);
+            }
+        }
+        for service in services {
+            match soterta::probe(&service, SOTER_HAL_GET_DEVICE_ID) {
+                Ok(text) => println!("{service} getDeviceId -> {text}"),
+                Err(error) => println!("{service} getDeviceId -> failed: {error:#}"),
+            }
+        }
+        std::process::exit(0);
+    }
     logging::init_logger_fallback(LevelFilter::Debug);
     let config = config::get();
     if config::parse_level_filter(&config.main.log_level).is_none() {
@@ -247,7 +441,7 @@ fn main() {
         }
     }
 
-    let (inject_keystore, inject_soter, extra_targets) = selected_targets();
+    let (inject_keystore, inject_soter, inject_soter_hidl, extra_targets) = selected_targets();
 
     if inject_keystore {
         match inject_named_process(KEYSTORE_PROCESS) {
@@ -273,7 +467,18 @@ fn main() {
             Err(e) => warn!("soter host injection skipped: {:#}", e),
         }
         // HAL 的进程名一家一个样，逐个试。谁都不在就都不注（宿主那条路照常）。
+        // 先动态扫一遍：cmdline 里带 soter 但不是腾讯宿主（那个上面已经单独注了）。
+        // 新厂商的 HAL 自己会认出来，不用改代码。
+        let mut hal_targets = discover_soter_hal_processes();
         for hal in SOTER_HAL_PROCESSES {
+            if !hal_targets.iter().any(|name| name == hal) {
+                hal_targets.push(hal.to_string());
+            }
+        }
+        if !hal_targets.is_empty() {
+            info!("soter hal targets: {hal_targets:?}");
+        }
+        for hal in &hal_targets {
             match inject_named_process(hal) {
                 Ok(()) => info!("soter hal injection completed ({hal})"),
                 Err(e) => info!("soter hal injection skipped ({hal}): {:#}", e),
@@ -281,6 +486,15 @@ fn main() {
         }
     } else {
         info!("soter host target skipped by OMMEGA_INJECT_TARGETS");
+    }
+
+    // 走 HIDL 调 SOTER 的厂商进程：它们既不是 HAL 也不叫 soter（一加的 cryptoeng 就是），
+    // 上面那套发现不到。它们发出去的正是 14 号 verifyAttkKeyPair 这类只有我们能答的号 ——
+    // 不注进去，工程模式那页的 SOTER 项就一直吃原厂 TA 的 -20。
+    if inject_soter || inject_soter_hidl {
+        inject_soter_hidl_clients();
+    } else {
+        info!("soter hidl client target skipped by OMMEGA_INJECT_TARGETS");
     }
 
     // 命令行上点名要注的额外进程（调试用）。同样只是 best-effort：少注一个不该让
@@ -430,18 +644,26 @@ mod tests {
     fn target_selection_keeps_unknown_names_as_extra_processes() {
         // 环境变量是进程级的，两个测试分开写会互相踩，所以挤在一个里串完。
         std::env::set_var("OMMEGA_INJECT_TARGETS", "keystore2,soter_hal_probe");
-        let (keystore2, soter, extras) = selected_targets();
+        let (keystore2, soter, soter_hidl, extras) = selected_targets();
         assert!(keystore2);
         assert!(!soter);
+        assert!(!soter_hidl);
         assert_eq!(extras, vec!["soter_hal_probe".to_string()]);
 
         std::env::set_var("OMMEGA_INJECT_TARGETS", "all");
-        let (keystore2, soter, extras) = selected_targets();
-        assert!(keystore2 && soter);
+        let (keystore2, soter, soter_hidl, extras) = selected_targets();
+        assert!(keystore2 && soter && soter_hidl);
         assert!(extras.is_empty());
 
+        std::env::set_var("OMMEGA_INJECT_TARGETS", "soter-hidl");
+        let (keystore2, soter, soter_hidl, _) = selected_targets();
+        assert!(
+            !keystore2 && !soter && soter_hidl,
+            "daemon 只叫这一路时别把别的一起注了"
+        );
+
         std::env::remove_var("OMMEGA_INJECT_TARGETS");
-        let (keystore2, soter, extras) = selected_targets();
+        let (keystore2, soter, _, extras) = selected_targets();
         assert!(keystore2 && soter);
         assert!(extras.is_empty());
     }

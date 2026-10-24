@@ -271,7 +271,13 @@ pub fn resolve_func_addr(
     Ok(remote_func_addr)
 }
 
-pub fn find_process_by_name(target_name: &str) -> Result<(i32, PathBuf)> {
+/// 按进程名找**全部**匹配的进程。
+///
+/// 同一个服务在多用户 / 分身下会起好几个实例（2026-10-22 实测魅族 20 Pro 上
+/// `soterserver` 在 system 与 u999 下各一个），只注第一个的话很可能注到没人用的那个
+/// 上 —— 客户端只绑自己那个 uid 的实例，注错了等于没注。
+pub fn find_processes_by_name(target_name: &str) -> Result<Vec<(i32, PathBuf)>> {
+    let mut found = Vec::new();
     for entry in std::fs::read_dir("/proc")?.flatten() {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
@@ -290,15 +296,19 @@ pub fn find_process_by_name(target_name: &str) -> Result<(i32, PathBuf)> {
         let target = std::fs::read_link(path.join("exe"))
             .unwrap_or_else(|_| PathBuf::from(format!("/proc/{pid}/exe")));
         debug!("found target executable path={:?} pid={}", target, pid);
-
-        return Ok((pid, target));
+        found.push((pid, target));
     }
 
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("Process '{}' not found", target_name),
-    ))
-    .context("")
+    if found.is_empty() {
+        return Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Process '{}' not found", target_name),
+        )))
+        .context("");
+    }
+    // 按 pid 排一下，日志读起来跟 `pidof` 一致
+    found.sort_by_key(|(pid, _)| *pid);
+    Ok(found)
 }
 
 pub fn process_name(pid: i32) -> Option<String> {

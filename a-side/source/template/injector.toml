@@ -24,10 +24,12 @@ enabled = true
 deny_packages = []
 block_android_package = true
 allow_unknown_package = false
-# 全局作用域：谁来调用都处理，不再看 `scoop` / deny / 未知包名规则。
+# 全局作用域：默认开——普通应用（每用户 uid 10000–19999）和显式绑定的系统 app 域
+# （工程模式）都接管，不再要求写进 `scoop`；ROM 系统包和系统进程（init /
+# system_server / keystore / vold / root）仍然走系统后端。
 # 正常由模块 WebUI 控制（它把 `global_scope` 写进 A 端平铺 config，并覆盖这里的值），
 # 这里保留一项是为了 schema 完整、也便于没有 WebUI 的场景。
-global_scope = false
+global_scope = true
 
 [intercept]
 get_security_level = true

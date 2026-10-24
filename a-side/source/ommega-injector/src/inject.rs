@@ -22,7 +22,7 @@ use crate::sys::wait_pid;
 use crate::{sys, utils};
 
 const ANDROID_DLEXT_USE_LIBRARY_FD: u64 = 0x10;
-const REMOTE_PAYLOAD_STATE_PATH: &str = "/data/adb/ommega/injector.payload";
+const REMOTE_PAYLOAD_STATE_PATH: &str = "/data/adb/ommega/conf/injector.payload";
 
 /// The daemon cannot look at another uid's /proc entry (hidepid hides those), so it has no
 /// way to tell what a socket peer process actually is. This is the list it checks against

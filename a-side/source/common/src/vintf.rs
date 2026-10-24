@@ -85,7 +85,20 @@ pub fn parse_aidl_hal_version_xml(
             continue;
         }
 
-        for version in hal.versions {
+        // VINTF 实践里，AIDL HAL 不写 <version> 等价于 version 1（检测器和 AOSP 的 VTS
+        // 都这么认）。以前这里没写就一个都不循环、直接返回 None，于是上层走了“按 Android
+        // 版本兜底”的路（Android 16 → 400）；而机器实际声明的是 v1（→100），
+        // Duck Detector 一比就是 VINTF MISMATCH，直接判 DANGER。
+        // 只在什么都没写的时候补一个 "1"，写了就照写的走。
+        let implicit_version;
+        let versions: &[String] = if hal.versions.is_empty() {
+            implicit_version = vec!["1".to_string()];
+            &implicit_version
+        } else {
+            &hal.versions
+        };
+
+        for version in versions {
             let version = version
                 .trim()
                 .parse::<i32>()

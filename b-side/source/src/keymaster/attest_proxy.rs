@@ -22,7 +22,11 @@ pub const SYSTEM_KEYMINT_STRONGBOX: &str =
 /// really is an `AttestationApplicationId` before handing it to the TEE.
 pub fn check_app_id_der(app_id_der: &[u8]) -> Result<()> {
     use der::Decode;
-    crate::plat::aaid::AttestationApplicationId::from_der(app_id_der)
+    // 两种编码都认：我们 A 端用 SET OF，系统 keystore2 用 SEQUENCE OF（AOSP 规范）。
+    if crate::plat::aaid::AttestationApplicationId::from_der(app_id_der).is_ok() {
+        return Ok(());
+    }
+    crate::plat::aaid::AttestationApplicationIdSeq::from_der(app_id_der)
         .map(|_| ())
         .map_err(|e| anyhow!("app_id_der is not a valid AttestationApplicationId: {e:?}"))
 }

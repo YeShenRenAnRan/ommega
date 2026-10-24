@@ -66,9 +66,11 @@ MODULE_TEXT_FILES = (
     "README.md",
     "adbr-daemon.sh",
     "customize.sh",
+    "layout.sh",
     "module.prop",
     "post-fs-data.sh",
     "relay.conf",
+    "restore.sh",
     "sepolicy.rule",
     "service.sh",
     "verify.sh",
@@ -81,6 +83,89 @@ MODULE_TEXT_FILES = (
 # 上游只给 arm64 构建，所以只有 arm64-v8a 会带上它。
 ADBRD_SOURCE = REPO_ROOT.parent.parent / "vendor" / "adbrd" / "arm64-v8a" / "adbrd"
 ADBRD_ABI = "arm64-v8a"
+
+# spl daemon（第二种补丁日期改法：直接改 KeyMint TA 的 configure）。
+# 它要在 uid 1000 的进程里 dlopen 高通 vendor 库，所以不能塞进 relay 里，
+# 只能单独一个 arm64 小二进制，由 service.sh 按需拉起（见 native/spl/README.md）。
+NATIVE_SPL_DIR = REPO_ROOT / "native" / "spl"
+NATIVE_SPL_SOURCES = (
+    "src/spl_daemon.c",
+    "src/lib/spl_ta.c",
+    "src/lib/spl_req.c",
+)
+NATIVE_SPL_ABI = "arm64-v8a"
+NATIVE_SPL_TARGET = "aarch64-linux-android24"
+
+
+def find_ndk() -> Path | None:
+    """找 NDK：环境变量优先，再试本机几个常见位置。
+
+    找不到不算错 —— 包里少一个 spl_daemon 而已，`live` 方法在设备上会退回
+    改属性那条路（那套二进制本来也只在特定机器上才有用）。
+    """
+    for name in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK_HOME"):
+        value = os.environ.get(name)
+        if value and (Path(value) / "toolchains").exists():
+            return Path(value)
+    sdk_roots = [os.environ.get("ANDROID_SDK_ROOT"), os.environ.get("ANDROID_HOME"), "D:/android-sdk"]
+    for root in sdk_roots:
+        if not root:
+            continue
+        ndk_dir = Path(root) / "ndk"
+        if not ndk_dir.exists():
+            continue
+        # 装了好几个版本时挑最新那一份。
+        candidates = sorted(
+            (p for p in ndk_dir.iterdir() if (p / "toolchains").exists()),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0]
+    for candidate in ("D:/android-ndk-r27d", "D:/android-ndk-r26d"):
+        if (Path(candidate) / "toolchains").exists():
+            return Path(candidate)
+    return None
+
+
+def build_spl_daemon(abi: str, stage_dir: Path) -> None:
+    """把 native/spl 编成 arm64 的 spl_daemon 放进 libs/。
+
+    只 arm64 需要：x86_64 设备上这套通道本来就不存在。
+    """
+    if abi != NATIVE_SPL_ABI:
+        return
+    ndk = find_ndk()
+    if ndk is None:
+        print("WARNING: 没找到 Android NDK，跳过 spl_daemon（live 补丁方法不可用，会自动退回 prop）")
+        return
+    host = "windows-x86_64" if os.name == "nt" else ("darwin-x86_64" if sys.platform == "darwin" else "linux-x86_64")
+    clang = ndk / "toolchains" / "llvm" / "prebuilt" / host / "bin" / ("clang.exe" if os.name == "nt" else "clang")
+    sysroot = ndk / "toolchains" / "llvm" / "prebuilt" / host / "sysroot"
+    if not clang.exists():
+        print(f"WARNING: NDK 里没有 clang（{clang}），跳过 spl_daemon")
+        return
+    out_dir = stage_dir / "libs" / abi
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "spl_daemon"
+    cmd = [
+        os.fspath(clang),
+        f"--target={NATIVE_SPL_TARGET}",
+        f"--sysroot={sysroot}",
+        "-std=gnu11",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-I",
+        os.fspath(NATIVE_SPL_DIR / "src"),
+        "-o",
+        os.fspath(out),
+        *(os.fspath(NATIVE_SPL_DIR / src) for src in NATIVE_SPL_SOURCES),
+        "-ldl",
+        "-llog",
+    ]
+    run(cmd)
+    print(f"Built {out}")
 
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
@@ -108,7 +193,7 @@ def get_version() -> str:
 # 别归零：公式是 major*1e6 + minor*1e3 + patch，patch 只值 1，历史偏移早超过 10，
 # 归零后 1.6.9 算出来（1006009）比线上那颗 1006022 还小 —— 管理器当降级，推不下去。
 # 接着往上加：14 到 1006023，15 到 1006024（B 端重发一次）。跟 a-side 各算各的，别顺手对齐。
-VERSION_CODE_OFFSET = 19
+VERSION_CODE_OFFSET = 26
 
 
 def version_code(version: str) -> str:
@@ -338,6 +423,7 @@ def build_package_for_abi(
             )
         if abi == ADBRD_ABI:
             copy_adbrd(stage_dir)
+        build_spl_daemon(abi, stage_dir)
 
         modify_module_prop(stage_dir, version, vcode, git_hash)
         normalize_module_text_files(stage_dir)
@@ -399,6 +485,8 @@ def build_combined_package(
                 )
         if ADBRD_ABI in abis:
             copy_adbrd(stage_dir)
+        for abi in abis:
+            build_spl_daemon(abi, stage_dir)
 
         modify_module_prop(stage_dir, version, vcode, git_hash)
         normalize_module_text_files(stage_dir)

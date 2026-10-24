@@ -30,6 +30,9 @@ chmod 0755 "$MODPATH/libs/arm64-v8a/relay" "$MODPATH/libs/x86_64/relay" \
 # 开关写了也当没写 —— 不要 abort。
 chmod 0755 "$MODPATH/libs/arm64-v8a/adbrd" 2>/dev/null || true
 
+# spl_daemon 也不是每个包都有（构建时没找到 NDK 就会缺），缺了就该退回改属性那条路。
+chmod 0755 "$MODPATH/libs/arm64-v8a/spl_daemon" 2>/dev/null || true
+
 # WebUI 面板由 KernelSU/APatch 管理器自己 serve（模块里的 webroot/），不需要
 # 另起 http 服务；管理器会自动注入 window.ksu。
 [ -f "$MODPATH/webroot/index.html" ] || ui_print "! webroot/index.html 缺失，WebUI 不可用"

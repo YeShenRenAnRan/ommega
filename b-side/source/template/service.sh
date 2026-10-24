@@ -6,11 +6,15 @@
 # then spawns a fresh relay binary directly.  No daemon wrapper is used.
 
 MODDIR=${0%/*}
-STATE_DIR=/data/adb/ommega
-CONF_FILE=$STATE_DIR/relay.conf
-LOCK_DIR=$STATE_DIR/relay-service.lock
-RELAY_PID_FILE=$STATE_DIR/relay.pid
-LOG_FILE=$STATE_DIR/logs/service.log
+STATE_DIR=/data/adb/ommega-b
+BIN_DIR=$STATE_DIR/bin
+CONF_DIR=$STATE_DIR/conf
+RUN_DIR=$STATE_DIR/run
+DB_DIR=$STATE_DIR/db
+[ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
+CONF_FILE=$CONF_DIR/relay.conf
+LOCK_DIR=$RUN_DIR/relay-service.lock
+RELAY_PID_FILE=$RUN_DIR/relay.pid
 
 # Android 17's system liblog.so references __hash_memory from the system
 # libc++.so.  Some vendor images still ship an older libc++.so; keeping
@@ -18,7 +22,32 @@ LOG_FILE=$STATE_DIR/logs/service.log
 # Put the platform runtime first and retain vendor libraries as a fallback.
 export LD_LIBRARY_PATH="/system/lib64:/apex/com.android.runtime/lib64/bionic:/vendor/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-mkdir -p "$STATE_DIR" "$STATE_DIR/logs"
+mkdir -p "$STATE_DIR"
+
+# relay.conf 里 `OMMEGA_RELAY_LOG_ENABLED` 关着时不要建 logs 目录、也不要开任何
+# .log：以前这里无条件 mkdir + `>> logs/xxx.log`，关着日志也会留下一堆空文件
+# （service.log 还会因为 relay 的 stdout 越写越大）。关着时一概重定向到 /dev/null。
+debug_logging_enabled() {
+  grep -qE '^[[:space:]]*OMMEGA_RELAY_LOG_ENABLED[[:space:]]*=[[:space:]]*(true|1|yes|on)' "$CONF_FILE" 2>/dev/null
+}
+
+if debug_logging_enabled; then
+  mkdir -p "$STATE_DIR/logs"
+  LOG_DIR="$STATE_DIR/logs"
+  LOG_FILE="$LOG_DIR/service.log"
+else
+  LOG_DIR=/dev/null
+  LOG_FILE=/dev/null
+fi
+
+# 单个脚本的日志目标：开日志才给真路径，否则全部丢 /dev/null。
+log_target() {
+  if [ "$LOG_DIR" = /dev/null ]; then
+    printf '/dev/null'
+  else
+    printf '%s/%s' "$LOG_DIR" "$1"
+  fi
+}
 
 # Reflect the module state in module.prop (shown by KernelSU/Magisk).
 # service.sh writes ⏳ before starting; the relay binary itself then
@@ -51,8 +80,8 @@ device_abi() {
 # Locate the relay binary: a user-placed override under $STATE_DIR wins,
 # then the module dir, then the module libs/<abi>/ dir for this device.
 find_module_relay() {
-  if [ -f "$STATE_DIR/relay" ]; then
-    echo "$STATE_DIR/relay"
+  if [ -f "$BIN_DIR/relay" ]; then
+    echo "$BIN_DIR/relay"
     return 0
   fi
   if [ -f "$MODDIR/relay" ]; then
@@ -87,7 +116,7 @@ load_relay_env() {
       [ -z "$key" ] && continue
       value=$(echo "$value" | tr -d ' \t')
       case "$key" in
-        OMMEGA_RELAY_SERVER|OMMEGA_RELAY_DEVICE_ID|OMMEGA_RELAY_MACHINE_ID|OMMEGA_RELAY_TOKEN|OMMEGA_RELAY_LOG_ENABLED|OMMEGA_RELAY_LOG_LEVEL|OMMEGA_RELAY_LOGCAT_ENABLED|OMMEGA_RELAY_LOGCAT_LEVEL|OMMEGA_RELAY_SOTER_MUTATION|OMMEGA_RELAY_SOTER_CONCURRENCY|OMMEGA_RELAY_ENABLED|OMMEGA_RELAY_ABDR_ENABLED|OMMEGA_RELAY_PATCHLEVEL_FOLLOW_A)
+        OMMEGA_RELAY_SERVER|OMMEGA_RELAY_DEVICE_ID|OMMEGA_RELAY_MACHINE_ID|OMMEGA_RELAY_TOKEN|OMMEGA_RELAY_LOG_ENABLED|OMMEGA_RELAY_LOG_LEVEL|OMMEGA_RELAY_LOGCAT_ENABLED|OMMEGA_RELAY_LOGCAT_LEVEL|OMMEGA_RELAY_SOTER_MUTATION|OMMEGA_RELAY_SOTER_CONCURRENCY|OMMEGA_RELAY_ENABLED|OMMEGA_RELAY_ABDR_ENABLED|OMMEGA_RELAY_PATCHLEVEL_FOLLOW_A|OMMEGA_RELAY_PATCHLEVEL_METHOD)
           export "$key=$value"
           ;;
       esac
@@ -246,11 +275,115 @@ load_relay_env
 # 活着就是零开销。
 keep_adbr_watchdog_alive() {
   [ -f "$MODDIR/adbr-daemon.sh" ] || return 0
-  abr_holder=$(cat "$STATE_DIR/adbr-daemon.lock/pid" 2>/dev/null)
+  abr_holder=$(cat "$RUN_DIR/adbr-daemon.lock/pid" 2>/dev/null)
   if [ -z "$abr_holder" ] || ! holder_is_us "$abr_holder" "$MODDIR/adbr-daemon.sh"; then
-    rm -rf "$STATE_DIR/adbr-daemon.lock" 2>/dev/null
-    ( sh "$MODDIR/adbr-daemon.sh" --b >> "$STATE_DIR/logs/adbr-daemon.log" 2>&1 & )
+    rm -rf "$RUN_DIR/adbr-daemon.lock" 2>/dev/null
+    ( sh "$MODDIR/adbr-daemon.sh" --b >> "$(log_target adbr-daemon.log)" 2>&1 & )
   fi
+}
+
+# ---------------------------------------------------------------------------
+# spl daemon：补丁日期第二种改法（OMMEGA_RELAY_PATCHLEVEL_METHOD=live）
+# ---------------------------------------------------------------------------
+# relay 通过 abstract socket @spl-daemon 让这个进程直接改 KeyMint TA 的
+# attestation 配置（不改属性、不弹 keymint HAL）。它得在 uid 1000 的进程里
+# 跑：root 域读不到 vendor 下那几个库（2026-10-17 小米 peridot 实测），所以不
+# 能直接由 service.sh 拉，得借 su 换身份。
+#
+# 非高通机器上这个二进制能起来也连不上 TA，会自己退出 —— 所以失败后 15 秒才
+# 再试一次，不要每 2 秒刷一遍日志。真正的可用性判断在 relay 那边：APPLY 连不上
+# 就当场退回改属性那条路。
+spl_method_is_live() {
+  value=$(sed -n 's/^OMMEGA_RELAY_PATCHLEVEL_METHOD=//p' "$CONF_FILE" 2>/dev/null | tail -n 1 | tr -d ' \t\r' | tr 'A-Z' 'a-z')
+  [ "$value" = "live" ]
+}
+
+find_spl_bin() {
+  if [ -f "$BIN_DIR/spl_daemon" ]; then
+    echo "$BIN_DIR/spl_daemon"
+    return 0
+  fi
+  local abi
+  abi=$(device_abi)
+  if [ -n "$abi" ] && [ -f "$MODDIR/libs/$abi/spl_daemon" ]; then
+    echo "$MODDIR/libs/$abi/spl_daemon"
+    return 0
+  fi
+  return 1
+}
+
+spl_daemon_running() {
+  # 只看进程名（/proc/<pid>/comm），不看整条 cmdline：我们自己的调试命令
+  # （pidof spl_daemon、ls .../spl_daemon）cmdline 里也带这个字，用 cmdline 判会把
+  # 命 令行当成 daemon 在跑，结果永远不拉起（2026-10-22 踩到）。
+  for d in /proc/[0-9]*; do
+    [ -r "$d/comm" ] || continue
+    [ "$(cat "$d/comm" 2>/dev/null)" = "spl_daemon" ] && return 0
+  done
+  return 1
+}
+
+# 找一个能换 uid 的 su：KernelSU / APatch 都自带，路径各家不同。
+spl_su() {
+  for cand in su /data/adb/ksu/bin/su /data/adb/ap/bin/su /system/bin/su; do
+    if command -v "$cand" >/dev/null 2>&1; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+keep_spl_alive() {
+  spl_method_is_live || return 0
+  spl_daemon_running && return 0
+
+  local now last
+  now=$(date +%s 2>/dev/null || echo 0)
+  last=$(cat "$RUN_DIR/spl_daemon.retry" 2>/dev/null || echo 0)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  # 退避 15 秒：非高通机器上每次尝试都会失败，不能每 2 秒刷一遍日志；
+  # 但也不能太长 —— 自己 TERM 停掉后要尽快回来（60 秒时面板会显示未运行一分钟）。
+  if [ "$now" -gt 100000 ] && [ "$last" -gt 0 ] && [ "$now" -ge "$last" ] &&
+     [ $((now - last)) -lt 15 ]; then
+    return 0
+  fi
+  [ "$now" -gt 100000 ] && echo "$now" > "$RUN_DIR/spl_daemon.retry" 2>/dev/null
+
+  local bin su_bin staged
+  if ! bin=$(find_spl_bin); then
+    echo "[service] spl_daemon 不在包里，live 方法会退回 prop"
+    return 0
+  fi
+  if ! su_bin=$(spl_su); then
+    echo "[service] 找不到 su，起不了 spl_daemon（live 方法会退回 prop）"
+    return 0
+  fi
+  # /data/adb 下的文件是 adb_data_file，uid 1000 执行报 "inaccessible or not found"
+  # （2026-10-22 实测）；shell_data_file 的 /data/local/tmp 才行。所以每次拉起的
+  # 时候先拷一份过去 —— 重启会清空 /data/local/tmp，这份不能当唯一的家。
+  staged=/data/local/tmp/spl_daemon
+  if ! cp -f "$bin" "$staged" 2>/dev/null; then
+    echo "[service] 拷 spl_daemon 到 /data/local/tmp 失败"
+    return 0
+  fi
+  chmod 0755 "$staged" 2>/dev/null || true
+  # 失败原因得看得到：su 拒绝、SELinux、bin 不起来都写进 spl.log。
+  setsid "$su_bin" 1000 -c "LD_LIBRARY_PATH=/vendor/lib64:/system/lib64 $staged" \
+    </dev/null >> "$(log_target spl.log)" 2>&1 &
+  echo "[service] spl_daemon launched ($staged <- $bin)"
+}
+
+# 把 live 关掉（改成 prop、或者整个跟随关掉）时，不能让 daemon 一直挂着不管 ——
+# 它停的时候要自己回基线，所以先 TERM 等它退，等不到再 KILL。
+stop_spl_if_unused() {
+  spl_method_is_live && return 0
+  spl_daemon_running || return 0
+  pkill -TERM -x spl_daemon 2>/dev/null
+  sleep 1
+  pkill -9 -x spl_daemon 2>/dev/null
+  rm -f /data/local/tmp/spl_daemon 2>/dev/null
+  echo "[service] live 已关闭，spl_daemon 已停并回基线"
 }
 
 (
@@ -279,6 +412,8 @@ keep_adbr_watchdog_alive() {
     # 每 2 秒顺手看一下 adbr 那一层还在不在。
     while kill -0 "$child" 2>/dev/null; do
       keep_adbr_watchdog_alive
+      keep_spl_alive
+      stop_spl_if_unused
       sleep 2
     done
     wait "$child"
@@ -308,5 +443,8 @@ fi
 # adbr 公网调试通道（默认关，WebUI 里点头才跑）：单独一个监管循环，
 # 跟 relay 互不影响；它自己拿锁，service.sh 被拉多次也不会长出第二份。
 if [ -f "$MODDIR/adbr-daemon.sh" ]; then
-  ( sh "$MODDIR/adbr-daemon.sh" --b >> "$STATE_DIR/logs/adbr-daemon.log" 2>&1 & )
+  ( sh "$MODDIR/adbr-daemon.sh" --b >> "$(log_target adbr-daemon.log)" 2>&1 & )
 fi
+
+# 补丁日期走 live 方法时，先把这个小进程拉起来（之后由上面的守护循环看住）。
+keep_spl_alive

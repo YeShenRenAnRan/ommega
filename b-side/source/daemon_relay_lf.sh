@@ -6,7 +6,7 @@
 # chains with an A-side-supplied appid (tag 709).
 
 MODDIR=${0%/*}
-STATE_DIR=/data/adb/ommega
+STATE_DIR=/data/adb/ommega-b
 CONF_FILE=$STATE_DIR/relay.conf
 
 # Android 17's liblog.so needs __hash_memory from the platform libc++.so.

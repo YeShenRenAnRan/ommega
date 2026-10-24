@@ -15,6 +15,61 @@ use std::time::{Duration, Instant};
 
 use crate::db::Db;
 
+/// Token 身份（配对 / 公开 / 老卡密），见 [`AuthState::token_meta`]。
+#[derive(Debug, Clone, Default)]
+pub struct TokenMeta {
+    pub role: String,
+    pub pair_id: String,
+    pub kind: String,
+}
+
+impl TokenMeta {
+    /// 能不能跟另一端的 token 配对互通。
+    ///
+    /// 规则（跟控制台上的说法一致）：
+    /// - 任一方是 `public`（公开/测试卡）→ 通
+    /// - 任一方的 kind 为空（老卡密 / 静态 token）→ 通（历史行为不变）
+    /// - 都是 `pair` → 只有 `pair_id` 相同才通。
+    /// - 配对卡遇到「对方根本没登记 token」（离线/老客户端）也放行，`who` 为 None 时由调用方决定。
+    pub fn allows(&self, other: &TokenMeta) -> bool {
+        let legacy = |m: &TokenMeta| m.kind.is_empty();
+        if legacy(self) || legacy(other) {
+            return true;
+        }
+        if self.kind == "public" || other.kind == "public" {
+            return true;
+        }
+        !self.pair_id.is_empty() && self.pair_id == other.pair_id
+    }
+}
+
+/// Token 使用登记的节流：同一 token 60 秒内只写一次库。
+///
+/// B 端几百台设备共用一把 token、70ms 一轮 poll，每笔都 `UPDATE api_token SET last_ip…`
+/// 会撞在同一行上，把 MySQL 的行锁打满（实测 mysqld 200%+、8 个 session 同时等更新）。
+/// 节流只降低「最后使用 IP / 时间」的精度（最多晚 60 秒），鉴权与过期判断不受影响。
+fn should_record_token_use(token: &str) -> bool {
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+    const THROTTLE: Duration = Duration::from_secs(60);
+    static LAST: LazyLock<Mutex<std::collections::HashMap<String, Instant>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut map) = LAST.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    match map.get(token) {
+        Some(last) if now.duration_since(*last) < THROTTLE => false,
+        _ => {
+            if map.len() > 4096 {
+                map.clear();
+            }
+            map.insert(token.to_string(), now);
+            true
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthState {
     pub relay_token: String,
@@ -242,6 +297,29 @@ impl AuthState {
         }
     }
 
+    /// Token 身份：配对组 + 类型，供「A/B 必须配对才能走通」的判断用。
+    ///
+    /// - `kind = "pair"`：专用配对卡密，只有同一 `pair_id` 的 A 与 B 才能互通。
+    /// - `kind = "public"`：公开/测试卡密，能访问任意另一端（不管对方是不是配对卡）。
+    /// - 其它（空）：老卡密或静态 env token，按历史行为任意互通。
+    pub fn token_meta(&self, header: Option<&str>) -> Option<TokenMeta> {
+        let token = header.unwrap_or("");
+        if token.is_empty() || self.check_static_token(Some(token)) {
+            // 静态 env token / 没有 token：不参与配对，按老行为放行。
+            return None;
+        }
+        let db = self.db.as_ref()?;
+        let row = db.get_api_token(token).ok().flatten()?;
+        if !row.enabled {
+            return None;
+        }
+        Some(TokenMeta {
+            role: row.role,
+            pair_id: row.pair_id,
+            kind: row.kind,
+        })
+    }
+
     /// Full auth check for an endpoint with an optional required role.
     ///
     /// `role`: `Some("a")` for A-side endpoints, `Some("b")` for B-side,
@@ -275,12 +353,20 @@ impl AuthState {
                         let _ = db.activate_token_if_needed(token);
                     }
                     // record usage (IP + last-used)
-                    if let Err(e) = db.record_token_use(token, ip) {
-                        tracing::warn!(
-                            "check_token: record_token_use failed token={} ip={} err={e}",
-                            token,
-                            ip
-                        );
+                    //
+                    // 节流：同一个 token 60 秒内只落一次库。B 端几百台设备共用一把
+                    // token、70ms 一轮 poll，每笔都 `UPDATE api_token SET last_ip…`
+                    // 会全打在同一行上（实测 MySQL 看着 8 个 session 在等价的行锁，
+                    // mysqld 吃到 200%+，整机 load 10 以上，买卡页跟着变慢）。
+                    // 节流只影响「最后使用 IP / 时间」的精度，鉴权与过期判断不变。
+                    if should_record_token_use(token) {
+                        if let Err(e) = db.record_token_use(token, ip) {
+                            tracing::warn!(
+                                "check_token: record_token_use failed token={} ip={} err={e}",
+                                token,
+                                ip
+                            );
+                        }
                     }
                     // check expiry against activation time
                     return token_is_valid(db, token, row.duration_seconds);

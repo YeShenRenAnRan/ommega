@@ -102,6 +102,10 @@ pub struct ApiTokenRow {
     pub created_at: String,
     pub last_ip: String,
     pub last_used_at: String,
+    /// 配对组 id：同组的 A/B 才能互通。空 = 老卡密（不参与配对，仍任意互通）。
+    pub pair_id: String,
+    /// `"pair"`（专用配对）/ `"public"`（公开测试）/ 空（老卡密）。
+    pub kind: String,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +400,8 @@ impl Db {
             created_at: row_str(&row, "created_at"),
             last_ip: row_str(&row, "last_ip"),
             last_used_at: row_str(&row, "last_used_at"),
+            pair_id: row_str(&row, "pair_id"),
+            kind: row_str(&row, "kind"),
         })
     }
 
@@ -406,10 +412,23 @@ impl Db {
         duration_seconds: i64,
         note: &str,
     ) -> anyhow::Result<()> {
+        self.insert_api_token_full(token, role, duration_seconds, note, "", "")
+    }
+
+    /// 同 [`insert_api_token`]，额外带上配对组与类型（`pair` / `public`）。
+    pub fn insert_api_token_full(
+        &self,
+        token: &str,
+        role: &str,
+        duration_seconds: i64,
+        note: &str,
+        pair_id: &str,
+        kind: &str,
+    ) -> anyhow::Result<()> {
         let mut conn = self.conn()?;
         conn.exec_drop(
-            "INSERT INTO api_token (token, role, duration_seconds, note, enabled, created_at)
-             VALUES (:token, :role, :duration_seconds, :note, :enabled, NOW())",
+            "INSERT INTO api_token (token, role, duration_seconds, note, enabled, created_at, pair_id, kind)
+             VALUES (:token, :role, :duration_seconds, :note, :enabled, NOW(), :pair_id, :kind)",
             params! {
                 "token" => token,
                 "role" => role,
@@ -418,6 +437,8 @@ impl Db {
                 // enabled / created_at 在线上库里都是 NOT NULL 且没有默认值，少写一个
                 // MySQL 严格模式就报 ERROR 1364（控制台生成 token 失败）。
                 "enabled" => 1i64,
+                "pair_id" => pair_id,
+                "kind" => kind,
             },
         )?;
         Ok(())
@@ -427,7 +448,7 @@ impl Db {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
-                    created_at, last_ip, last_used_at
+                    created_at, last_ip, last_used_at, pair_id, kind
              FROM api_token ORDER BY id DESC",
             (),
         )?;
@@ -443,7 +464,7 @@ impl Db {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn.exec(
             "SELECT id, token, role, duration_seconds, note, enabled, activated_at,
-                    created_at, last_ip, last_used_at
+                    created_at, last_ip, last_used_at, pair_id, kind
              FROM api_token WHERE token = :token LIMIT 1",
             params! {
                 "token" => token,
@@ -548,6 +569,19 @@ impl Db {
             "UPDATE api_token SET enabled = :enabled WHERE id = :id",
             params! {
                 "enabled" => enabled as i64,
+                "id" => id,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// 改一张卡的配对组（控制台上可编辑；空字符串 = 不配对）。
+    pub fn set_token_pair_id(&self, id: i64, pair_id: &str) -> anyhow::Result<()> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "UPDATE api_token SET pair_id = :pair_id WHERE id = :id",
+            params! {
+                "pair_id" => pair_id,
                 "id" => id,
             },
         )?;

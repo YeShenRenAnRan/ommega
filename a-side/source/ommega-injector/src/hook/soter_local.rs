@@ -51,6 +51,8 @@ use crate::hook::soter;
 const OK: i32 = 0;
 /// "这把钥匙不在这台设备上"。实测 hasAskAlready / exportAuthKeyPublicKey 都回它。
 const NOT_FOUND: i32 = -5;
+/// AuthKey 还没建。真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成 ASK 没就绪。
+const AUTH_KEY_NOT_READY: i32 = -6;
 /// ASK 里写死的盐长，也正好是 SHA-256 的摘要长度。
 const SALT_LEN: i32 = 32;
 /// 编译进来的那把私钥（PKCS#8 PEM）—— 候选文件都没有时才用它。
@@ -230,18 +232,12 @@ pub(crate) fn device_id() -> String {
     cpu_id()
 }
 
-/// 这个值多久重新看一眼文件。真机 cpu_id 一辈子不换，这个时限只是为了「daemon 刚
-/// 学到新的、payload 不用重启就跟着改」，跟 `log_flag` 一样 30 秒。
-const CPU_ID_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// 当前该报的 cpu_id 加上它是什么时候看来的（来路只在换值那行日志里出现，不留）。
-struct CpuIdCache {
-    value: String,
-    read_at: std::time::Instant,
-}
-
-static CPU_ID: Mutex<Option<CpuIdCache>> = Mutex::new(None);
-
+/// 当前该报的 cpu_id。
+///
+/// 不缓存：
+/// `line!` 之前这里是「30 秒看一次文件」的缓存，后来改成每次都现读（daemon 学到新值就
+/// 立即跟上，少一份状态少一个错），但常量和结构体没清，编译会报三个 dead_code。
+/// 真机 cpu_id 一辈子不换，这里读文件的开销可以忽略。
 /// 本地兜底这条路上该报的 cpu_id：**只按本机真实序列号派生**。
 ///
 /// 不能读 `/data/misc/ommega/soter_cpu_id` 那份：那是转发给服务端用的 **B 端真机号**
@@ -249,6 +245,20 @@ static CPU_ID: Mutex<Option<CpuIdCache>> = Mutex::new(None);
 /// 拿 B 的号会让同一个 uid 下出现两个不同的 cpu_id —— 检测器一条「两次 cpuid 不一致」
 /// 直接判红。两份身份各用各的：转发走 B 的号，本地走本机号。
 fn cpu_id() -> String {
+    // 顺序：daemon 学来的那份（`CPU_ID_PATHS` 文件 / 环境变量）→ 本机序列号派生。
+    //
+    // 优先用文件是因为那个位置就是给 app 域准备的（`system_app_data_file`），一定读得到；
+    // 而 `prop()` 在注入进去的 payload 里读不到 `ro.boot.serialno`（NX721J 实测：shell 的
+    // `getprop` 能读到序列号，payload 里却拿不到），于是 `cpu_id()` 空、整层不答。
+    //
+    // 代价：文件里存的是 daemon 从真机学来的号，不是本机序列号派生的那个。同一 uid 下
+    // 转发和本地报不同号时检测器会判「两次 cpuid 不一致」；但「不答」比「号不一致」更糟
+    // （前者整条链路直接不通），所以先取文件。
+    let (learned, source) = load_cpu_id();
+    if let Some(value) = learned {
+        log::debug!("event=soter cpu_id from {source}");
+        return value;
+    }
     device_info().derived_cpu_id.clone().unwrap_or_default()
 }
 
@@ -294,21 +304,23 @@ extern "C" {
     fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
 }
 
-/// 读一条系统属性。payload 跑在 uid 1000 的系统进程里，直接调 bionic 比 fork 一个
-/// `getprop` 便宜几个数量级（签名这条路径上每毫秒都算数）。
+/// 读一条系统属性。
+///
+/// 走 `getprop` 命令而不是 `__system_property_get`：后者在 dlopen 进来的 payload 里实测
+/// 读不到（NX721J：shell 里 `getprop ro.boot.serialno` 能拿到序列号，payload 里
+/// `__system_property_get` 返回 0，静默当成“没这条属性”）。签名这条路径每毫秒都算数，
+/// 但多 fork 一次 `getprop` 换“真能读到”比省那点开销值。
 #[cfg(target_os = "android")]
 pub(crate) fn prop(name: &str) -> Option<String> {
-    use std::ffi::CStr;
-    let name = std::ffi::CString::new(name).ok()?;
-    // bionic 的 PROP_VALUE_MAX 是 92，留点余量。
-    let mut buf = [0 as libc::c_char; 128];
-    let len = unsafe { __system_property_get(name.as_ptr(), buf.as_mut_ptr()) };
-    if len <= 0 {
+    let output = std::process::Command::new("/system/bin/getprop")
+        .arg(name)
+        .output()
+        .ok()?;
+    if !output.status.success() {
         return None;
     }
-    let value = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().ok()?;
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_string())
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 /// 非 Android（开发机上 `cargo check` 这种）读不到属性，一律当没有，走兜底值。
@@ -334,6 +346,13 @@ fn device_info() -> &'static DeviceInfo {
     static INFO: OnceLock<DeviceInfo> = OnceLock::new();
     INFO.get_or_init(|| {
         let serial = prop("ro.boot.serialno").or_else(|| prop("ro.serialno"));
+        // 这条是为了查「本地层为何不答」：`answer()` 只要 `cpu_id()` 空就整笔不答，
+        // 而空的原因可能是属性读不到、也可能是派生失败，光看一条 WARN 分不清。
+        log::info!(
+            "event=soter device_info serial={:?} derived_cpu_id={:?}",
+            serial,
+            serial.as_deref().map(cpu_id_from)
+        );
         DeviceInfo {
             derived_cpu_id: serial.as_deref().map(cpu_id_from),
             fp_n: fingerprint_name(),
@@ -343,6 +362,23 @@ fn device_info() -> &'static DeviceInfo {
             fid: fid_from(serial.as_deref()),
         }
     })
+}
+
+/// 32 字符 hex 转 16 字节。真机 getDeviceId 出的是二进制，不是文本。
+fn hex_bytes(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
 }
 
 /// 一台像真机的设备号：`09000000` + 12 字节十六进制。只拿真实序列号算，没有就不算。
@@ -437,9 +473,10 @@ pub(crate) enum Answer {
 
 /// 本地后端写了实现的那些 HAL 号码（就是 `answer` 里那几个 match 臂）。
 ///
-/// 2 / 6 / 14 不在里面：宿主那半边根本不发这三个（它自己那份 proxy 里是空号），本地
-/// 也就没写。清单放这儿是为了让拦截那侧只需要问一句「这个号你答得了吗」。
-pub(crate) const HANDLED_CODES: [u32; 11] = [1, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13];
+/// 2 / 6 / 14 是产线 provisioning（工程模式那页的 SOTER key 就看 14 号）：原厂 TA
+/// 没 provisioning 时整族回 -20，宿主那半边也不发这三个，所以只能我们顶 —— 软件 TA
+/// 里 ASK 兼 ATTK，VERIFY 永远成功、EXPORT 交 ASK 那份自描述。
+pub(crate) const HANDLED_CODES: [u32; 14] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
 /// 这个号码本地答得了吗。`true` 只说「有对应的实现」——参数不够的时候 `answer`
 /// 照样返回 `None`，上层会原样透给真 HAL，所以这里不用把参数也掰开看一遍。
@@ -447,12 +484,70 @@ pub(crate) fn answerable(code: u32) -> bool {
     HANDLED_CODES.contains(&code)
 }
 
+/// 这个会话号是不是本进程开的。
+///
+/// `initSign` 那笔要是服务端说「你本地答」（白名单外的检测器一类），会话就存在这里；
+/// 那 `finishSign` 也必须回来本地答 —— 去问远程就是 B 端不认识这个句柄，直接回 -204。
+pub(crate) fn has_session(session: i64) -> bool {
+    state()
+        .and_then(|state| {
+            state
+                .sessions
+                .lock()
+                .ok()
+                .map(|map| map.contains_key(&session))
+        })
+        .unwrap_or(false)
+}
+
 /// 按号码算一笔应答。认不出来、或者少参数就返回 `None`，让上层透给真 HAL。///
 /// 只处理 HAL 那半边（`call.hal`）：App 面向那半边是宿主自己的事，它会把我们的
 /// 结果原样包成 `SoterExportResult` 递给 App，不用我们操心。
 pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
+    let result = answer_inner(call);
+    // 记一笔应答。光看「调用进去了」不够 —— 得知道它回来了什么，
+    // 才能分清是没答（透传）还是答错（形状/码不对）。`data` 只记长度，不刷字节。
+    match &result {
+        Some(Answer::Code(code)) => {
+            log::info!("event=soter local answer op={} code={}", call.code, code)
+        }
+        Some(Answer::Buffer { code, data }) => log::info!(
+            "event=soter local answer op={} code={} len={}",
+            call.code,
+            code,
+            data.as_ref().map(|bytes| bytes.len()).unwrap_or(0)
+        ),
+        Some(Answer::Init { status, session }) => log::info!(
+            "event=soter local answer op={} status={} session={}",
+            call.code,
+            status,
+            session
+        ),
+        None => log::info!(
+            "event=soter local answer op={} = none (passthrough)",
+            call.code
+        ),
+    }
+    result
+}
+
+/// 实际的应答逻辑，外壳在 [`answer`]。
+fn answer_inner(call: &soter::SoterCall) -> Option<Answer> {
     if !call.hal {
         return None;
+    }
+    // 产线 provisioning 三兄弟最先处理：不碰本机身份、也不建钥匙，跟 cpu_id 那条
+    // 前置检查无关（工程模式跑在 vendor 域，那份 cpu_id 文件它常常读不到）。
+    match call.code {
+        14 => return Some(Answer::Code(OK)),
+        6 => return Some(Answer::Code(OK)),
+        2 => {
+            return Some(Answer::Buffer {
+                code: OK,
+                data: Some(ask_public_document(call.uid.unwrap_or(-1))),
+            })
+        }
+        _ => {}
     }
     let state = state()?;
     // 没有任何真实来源（daemon 那份没读到、本机序列号也读不到）时，这台机器没有可报的
@@ -488,7 +583,7 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
                     })
                 }
                 None => Some(Answer::Buffer {
-                    code: NOT_FOUND,
+                    code: AUTH_KEY_NOT_READY,
                     data: None,
                 }),
             }
@@ -509,11 +604,10 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
                         data: Some(envelope(&document, &signature)),
                     })
                 }
-                // 会话丢了就是丢了，跟真机一个码；别透给真 HAL（那条腿本来就是废的）
-                None => Some(Answer::Buffer {
-                    code: NOT_FOUND,
-                    data: None,
-                }),
+                // 本地没这个会话：说明 initSign 是托管端落的号，这边的会话表里压根没有。
+                // 回 -1000 会让「远端建会话、本地收尾」那条路永远签不成（检测器的
+                // T12 就是这么挂的），得退回去让上层转给托管端。
+                None => None,
             }
         }
         // generateAskKeyPair(uid) —— 真机上这是建 ASK，我们这把一开始就在，
@@ -540,7 +634,9 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
         // getDeviceId()
         8 => Some(Answer::Buffer {
             code: OK,
-            data: Some(device_id().into_bytes()),
+            // 回 16 字节 raw：真机 TA 出的是二进制，检测器转 hex 后再跟 cpu_id 比。
+            // 把 hex 文本当字节发出去，检测器看到的是 "30393030…"，对不上。
+            data: Some(hex_bytes(&device_id()).unwrap_or_default()),
         }),
         // hasAskAlready(uid) —— 兜底层**必须**答「没有」。
         //
@@ -564,14 +660,14 @@ pub(crate) fn answer(call: &soter::SoterCall) -> Option<Answer> {
         10 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
             let present = auth_key(state, uid, alias).is_some();
-            Some(Answer::Code(if present { OK } else { NOT_FOUND }))
+            Some(Answer::Code(if present { OK } else { AUTH_KEY_NOT_READY }))
         }
         // initSign(uid, alias, challenge)
         11 => {
             let (uid, alias) = (call.uid?, call.alias.as_deref()?);
             if auth_key(state, uid, alias).is_none() {
                 return Some(Answer::Init {
-                    status: NOT_FOUND,
+                    status: AUTH_KEY_NOT_READY,
                     session: 0,
                 });
             }
@@ -862,9 +958,11 @@ mod tests {
     }
 
     #[test]
-    fn device_id_answers_the_whole_32_chars() {
+    fn device_id_answers_16_raw_bytes() {
+        // 真机 TA 的 getDeviceId 出二进制（16 字节），检测器转 hex 后再跟 cpu_id 比。
         let data = as_buffer(answer(&call(8, None, None)));
-        assert_eq!(data, device_id().into_bytes());
+        assert_eq!(data, hex_bytes(&device_id()).unwrap());
+        assert_eq!(data.len(), 16);
     }
 
     #[test]
@@ -872,7 +970,7 @@ mod tests {
         let uid = 4242;
         assert_eq!(
             as_code(answer(&call(10, Some(uid), Some("SoterAuthKey")))),
-            NOT_FOUND
+            AUTH_KEY_NOT_READY
         );
 
         assert_eq!(
@@ -896,7 +994,7 @@ mod tests {
         );
         assert_eq!(
             as_code(answer(&call(10, Some(uid), Some("SoterAuthKey")))),
-            NOT_FOUND
+            AUTH_KEY_NOT_READY
         );
     }
 
@@ -907,7 +1005,10 @@ mod tests {
         assert_eq!(as_code(answer(&call(7, Some(b), Some("k")))), OK);
 
         assert_eq!(as_code(answer(&call(12, Some(a), None))), OK);
-        assert_eq!(as_code(answer(&call(10, Some(a), Some("k")))), NOT_FOUND);
+        assert_eq!(
+            as_code(answer(&call(10, Some(a), Some("k")))),
+            AUTH_KEY_NOT_READY
+        );
         assert_eq!(as_code(answer(&call(10, Some(b), Some("k")))), OK);
     }
 
@@ -957,16 +1058,18 @@ mod tests {
         let mut c = call(11, Some(7777), Some("NoSuchKey"));
         c.challenge = Some("00".to_string());
         assert!(
-            matches!(answer(&c), Some(Answer::Init { status, .. }) if status == NOT_FOUND),
-            "a missing auth key must come back as a -5 status"
+            matches!(answer(&c), Some(Answer::Init { status, .. }) if status == AUTH_KEY_NOT_READY),
+            "a missing auth key must come back as a -6 status"
         );
     }
 
     #[test]
-    fn finish_sign_with_an_unknown_session_reports_not_found() {
+    fn finish_sign_with_an_unknown_session_falls_through() {
+        // 不认识的会话号不能本地硬回 -1000：那可能正是托管端落的号，
+        // 得放行出去让它接着答。
         let mut c = call(4, None, None);
         c.session = Some(1);
-        assert_eq!(as_buffer_code(answer(&c)), NOT_FOUND);
+        assert!(answer(&c).is_none());
     }
 
     /// 拆信封：`[i32 le JSON 长度][JSON][签名]`。

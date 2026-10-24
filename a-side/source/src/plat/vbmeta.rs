@@ -215,15 +215,22 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
     let property_boot_patch = resetprop::read_string_property(BOOT_PATCH_PROP)
         .or_else(|| read_build_prop_value(BOOT_PATCH_PROP));
     let boot_patch = if trust.boot_patchlevel.trim() == "auto" {
-        match read_abl_boot_patchlevel() {
-            Ok(value) => Some(value),
-            Err(error) => {
-                log::warn!(
-                    "failed to resolve boot patch level from boot metadata: {error:#}; using property fallback"
-                );
-                property_boot_patch
-            }
-        }
+        // 顺序：属性 → boot 镜像编译日期 → AVB 元数据。
+        //
+        // 属性是面板「伪装参数」和服务器同步写的那份，最先认；没有的话用 boot
+        // 镜像的编译日期 —— 检测器比的就是它（ro.bootimage.build.date.utc 与链上
+        // boot 补丁），跟它对上才不会差几个月。AVB 里的值放最后：不少机型那里陈
+        // 旧得很，只能当个兜底。
+        property_boot_patch
+            .clone()
+            .or_else(bootimage_date_patchlevel)
+            .or_else(|| match read_abl_boot_patchlevel() {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    log::warn!("failed to resolve boot patch level from boot metadata: {error:#}");
+                    None
+                }
+            })
     } else {
         property_boot_patch
     };
@@ -245,6 +252,34 @@ pub(crate) fn resolve_patch_levels(trust: &RawTrustConfig) -> Result<ResolvedPat
         observed_security_patch.as_deref(),
         latest.as_deref(),
     )
+}
+
+/// `ro.bootimage.build.date.utc` 的 epoch 秒转成 YYYYMMDD。
+///
+/// AVB 里没给 boot 补丁级别时用它当近似值：检测器比的就是这个属性（boot 镜像
+/// 的编译日期）跟链上的 boot 补丁级别，差一个月以上就报警。
+fn bootimage_date_patchlevel() -> Option<String> {
+    let raw = resetprop::read_string_property("ro.bootimage.build.date.utc")?;
+    let secs: i64 = raw.trim().parse().ok()?;
+    if secs <= 0 {
+        return None;
+    }
+    let (y, m, d) = civil_from_days(secs / 86400);
+    Some(format!("{y:04}{m:02}{d:02}"))
+}
+
+/// Howard Hinnant 的 `days_from_civil` 逆运算：epoch 天数 → (年, 月, 日)。
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn resolve_patch_levels_from(
@@ -948,6 +983,16 @@ fn extract_verified_boot_hash_from_metadata(metadata: &KeyMetadata) -> Result<[u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_image_epoch_turns_into_a_patchlevel_date() {
+        // 1787129795 = 2026-08-19T00:56:35Z
+        assert_eq!(civil_from_days(1_787_129_795 / 86400), (2026, 8, 19));
+        // 1770000000 = 2026-02-02
+        assert_eq!(civil_from_days(1_770_000_000 / 86400), (2026, 2, 2));
+        // 0 = 1970-01-01
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
 
     #[test]
     fn avb_public_key_digest_matches_embedded_blob_hash() {

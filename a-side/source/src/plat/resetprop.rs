@@ -65,7 +65,7 @@ const RESETPROP_FALLBACKS: &[(&str, Option<&str>)] = &[
 /// 模块自己带的那份（实现是 vendor/ 里的 resetprop-rs，安装时
 /// customize.sh 把与设备 ABI 匹配的那份拷到这里）。它排在最前面：管理器的
 /// resetprop 不是每家都有、行为也不一致，不再依赖它们。
-const RESETPROP_BUNDLED: &str = "/data/adb/ommega/resetprop";
+const RESETPROP_BUNDLED: &str = "/data/adb/ommega/bin/resetprop";
 
 #[derive(Clone)]
 pub struct ResetpropCommand {

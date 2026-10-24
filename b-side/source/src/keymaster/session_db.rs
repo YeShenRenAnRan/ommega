@@ -10,7 +10,7 @@
 //!      使用算），两边讲的是同一件事。
 //!
 //! 旧目录**原样不动**：刷回旧版本时那边照样读得到，等于现成的回滚源；确认没问题后
-//! 手工 `rm -rf /data/adb/ommega/sessions` 就把那一百多 MB 收回来了。
+//! 手工 `rm -rf /data/adb/ommega-b/sessions` 就把那一百多 MB 收回来了。
 //!
 //! 库打不开不致命：退回纯内存会话（重启即丢，但设备还在干活），同时响亮地报一条
 //! error —— 静默降级会让人回头去别处找原因。
@@ -25,10 +25,10 @@ use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// 库文件位置的默认值。演练/换机器时可以用 `OMMEGA_SESSIONS_DB` 指到别处。
-pub const DEFAULT_DB_PATH: &str = "/data/adb/ommega/sessions.db";
+pub const DEFAULT_DB_PATH: &str = "/data/adb/ommega-b/db/sessions.db";
 /// 旧版「一个别名一个 JSON」的目录，只在库还空着的时候导入一次。
 /// 跟库文件一样可以用 `OMMEGA_SESSIONS_DIR` 顶掉。
-pub const DEFAULT_LEGACY_DIR: &str = "/data/adb/ommega/sessions";
+pub const DEFAULT_LEGACY_DIR: &str = "/data/adb/ommega-b/db/sessions";
 
 pub fn db_path() -> PathBuf {
     std::env::var_os("OMMEGA_SESSIONS_DB")
@@ -540,7 +540,7 @@ mod tests {
     /// 要用 OMMEGA_SESSIONS_DB / OMMEGA_SESSIONS_DIR 两个环境变量指路：
     ///
     /// ```text
-    /// cp -r /data/adb/ommega/sessions /data/local/tmp/sessions-drill
+    /// cp -r /data/adb/ommega-b/sessions /data/local/tmp/sessions-drill
     /// OMMEGA_SESSIONS_DB=/data/local/tmp/drill.db \
     ///   OMMEGA_SESSIONS_DIR=/data/local/tmp/sessions-drill \
     ///   ./ommega-sessdb-test --ignored drill_from_the_real_sessions_dir --nocapture

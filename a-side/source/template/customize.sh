@@ -175,29 +175,53 @@ if [ -f "$CLIENTA_CONF" ]; then
 fi
 
 STRONGBOX_FEATURE="android.hardware.security.strongbox_keystore.xml"
-if [ "$STRONGBOX_HIDDEN" = true ]; then
+DEVICE_IDS_FEATURE="android.software.device_id_attestation.xml"
+
+# 声明「不支持 ID 认证」：置上 hide_device_ids 就给声明的 XML 种 whiteout。
+# 与 StrongBox 同一套机制，安装时就把两种开关都读一遍。
+# 默认关：只有显式写 1/true 才遮（“没写就不瑞”）。
+DEVICE_IDS_HIDDEN=false
+CLIENTA_CONF=/data/misc/keystore/ommega/config
+if [ -f "$CLIENTA_CONF" ]; then
+  ids_val=$(grep -iE '^[[:space:]]*(hide_device_ids|no_device_ids|hide_device_id_attestation)[[:space:]]*:' "$CLIENTA_CONF" 2>/dev/null | head -n 1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+  case "$ids_val" in
+    1|true|yes|on) DEVICE_IDS_HIDDEN=true ;;
+    0|false|no|off) DEVICE_IDS_HIDDEN=false ;;
+  esac
+  unset ids_val
+fi
+
+place_feature_mask() {
+  pf_feature=$1
   for src_dir in \
     /system/etc/permissions \
     /system_ext/etc/permissions \
     /vendor/etc/permissions \
     /product/etc/permissions; do
-    [ -f "$src_dir/$STRONGBOX_FEATURE" ] || continue
+    [ -f "$src_dir/$pf_feature" ] || continue
     # 模块镜像里的路径：Magisk 约定是 system/<分区>/...，而 /system 自己
     # 不再带一层前缀（不然会变成 /system/system/...）。
     rel=${src_dir#/}
     rel=${rel#system/}
     tgt="$MODPATH/system/$rel"
     mkdir -p "$tgt"
-    if mknod "$tgt/$STRONGBOX_FEATURE" c 0 0 2>/dev/null; then
-      ui_print "- StrongBox whiteout: $rel/$STRONGBOX_FEATURE"
+    if mknod "$tgt/$pf_feature" c 0 0 2>/dev/null; then
+      ui_print "- $pf_feature whiteout: $rel"
     else
       # mknod 被拒（SELinux/内核限制）时退化为空声明覆盖，效果一致
-      printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions/>\n' > "$tgt/$STRONGBOX_FEATURE"
-      ui_print "- StrongBox overlay: $rel/$STRONGBOX_FEATURE (whiteout unavailable)"
+      printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions/>\n' > "$tgt/$pf_feature"
+      ui_print "- $pf_feature overlay: $rel (whiteout unavailable)"
     fi
   done
+}
+
+if [ "$STRONGBOX_HIDDEN" = true ]; then
+  place_feature_mask "$STRONGBOX_FEATURE"
 fi
-unset STRONGBOX_FEATURE STRONGBOX_HIDDEN CLIENTA_CONF
+if [ "$DEVICE_IDS_HIDDEN" = true ]; then
+  place_feature_mask "$DEVICE_IDS_FEATURE"
+fi
+unset STRONGBOX_FEATURE DEVICE_IDS_FEATURE STRONGBOX_HIDDEN DEVICE_IDS_HIDDEN CLIENTA_CONF
 
 # resetprop：模块自己带一个（实现是 vendor/ 里的 resetprop-rs，源码在 vendor/prop-rs*、
 # vendor/prop-rs-android 和 resetprop/src/）。
@@ -205,15 +229,31 @@ unset STRONGBOX_FEATURE STRONGBOX_HIDDEN CLIENTA_CONF
 # 都有，行为也不一致，所以不再依赖。这里把与设备 ABI 匹配的那份拷到状态目录一份，
 # 开机脚本和 keystore 里的代码都只认这一个路径。
 CONFIG_DIR=/data/adb/ommega
-mkdir -p "$CONFIG_DIR"
+BIN_DIR=$CONFIG_DIR/bin
+CONF_DIR=$CONFIG_DIR/conf
+RUN_DIR=$CONFIG_DIR/run
+DB_DIR=$CONFIG_DIR/db
+mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$CONF_DIR" "$RUN_DIR" "$DB_DIR" "$CONFIG_DIR/logs"
+# 老版本平铺在根目录的文件先搬进新子目录（只支持新路径，不做读取兜底）。
+for f in keymint ommega-inject soterta-ta resetprop adbrd; do
+  [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$BIN_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$BIN_DIR/$f"
+done
+for f in props.conf injector.payload pathmask.state pathmask.owned \
+         remote_identity.applied remote_identity.updated empty_permissions.xml \
+         relay.conf log_flag; do
+  [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$CONF_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$CONF_DIR/$f"
+done
+for f in sessions.db sessions.db-wal sessions.db-shm; do
+  [ -f "$CONFIG_DIR/$f" ] && [ ! -e "$DB_DIR/$f" ] && mv -f "$CONFIG_DIR/$f" "$DB_DIR/$f"
+done
 if [ -f "$BINDIR/resetprop" ]; then
-  cp -f "$BINDIR/resetprop" "$CONFIG_DIR/resetprop.tmp"
-  chmod 0755 "$CONFIG_DIR/resetprop.tmp"
-  mv -f "$CONFIG_DIR/resetprop.tmp" "$CONFIG_DIR/resetprop"
+  cp -f "$BINDIR/resetprop" "$BIN_DIR/resetprop.tmp"
+  chmod 0755 "$BIN_DIR/resetprop.tmp"
+  mv -f "$BIN_DIR/resetprop.tmp" "$BIN_DIR/resetprop"
   ui_print "- Bundled resetprop installed (no longer depends on the root manager)"
 fi
-rm -f "$CONFIG_DIR/restart.keymint" "$CONFIG_DIR/restart.injector" "$CONFIG_DIR/restart.all"
-rm -f "$CONFIG_DIR/keymint" "$CONFIG_DIR/ommega-inject" "$CONFIG_DIR/injector" # clean up old hot-update binaries
+rm -f "$RUN_DIR/restart.keymint" "$RUN_DIR/restart.injector" "$RUN_DIR/restart.all"
+rm -f "$BIN_DIR/keymint" "$BIN_DIR/ommega-inject" "$CONFIG_DIR/injector" # clean up old hot-update binaries
 
 if [ ! -e "$CONFIG_DIR/ommegadata" ] && [ ! -L "$CONFIG_DIR/ommegadata" ]; then
   ln -s /data/misc/keystore/ommega "$CONFIG_DIR/ommegadata"

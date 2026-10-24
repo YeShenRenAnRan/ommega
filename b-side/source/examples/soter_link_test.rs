@@ -4,7 +4,7 @@
 //! polls for tasks exactly like the relay does (same endpoints, same token, same
 //! capability report), runs `soter` tasks through the production path, and posts
 //! the results back.  It exists so the whole chain can be exercised without
-//! touching the installed relay or its config file (`/data/adb/ommega/relay.conf`
+//! touching the installed relay or its config file (`/data/adb/ommega-b/relay.conf`
 //! has a fixed path, so a second relay instance cannot run next to it).
 //!
 //! ```text

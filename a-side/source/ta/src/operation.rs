@@ -649,6 +649,54 @@ impl crate::KeyMintTa {
     }
 
     /// Return the associated [`Operation`], removing it.
+    /// 如果这单是远程 key 的 finish，把要转发的数据取出来并结束 operation；不是远程就
+    /// 原样放回去返回 None，调用方照旧走 `finish()`。
+    ///
+    /// 为什么要多这一道：远端签名是百毫秒级的网络请求，而 `KeyMintTa` 被
+    /// `KeyMintDevice` 的全局 Mutex 包着。在锁内做网络会把别人的 begin 一起堵住，
+    /// 检测器（TrustAttestor keystore_timing）量的就是“忙时 begin 慢不慢”。
+    ///
+    /// 返回 `(is_sign, alias, algorithm, data)`，由调用方在锁外完成请求。
+    pub fn take_remote_finish(
+        &mut self,
+        op_handle: i64,
+        data: Option<&[u8]>,
+        auth_token: Option<HardwareAuthToken>,
+        timestamp_token: Option<TimeStampToken>,
+    ) -> Result<Option<(bool, String, String, Vec<u8>)>, Error> {
+        let op_idx = self.op_index(OpHandle(op_handle))?;
+        let mut op = self.operations[op_idx]
+            .take()
+            .unwrap(/* safe: op_index() checks */);
+        let remote = match &op.crypto_op {
+            CryptoOperation::RemoteSign {
+                alias, algorithm, ..
+            } => Some((true, alias.clone(), algorithm.clone())),
+            CryptoOperation::RemoteDecrypt {
+                alias, algorithm, ..
+            } => Some((false, alias.clone(), algorithm.clone())),
+            _ => None,
+        };
+        let Some((is_sign, alias, algorithm)) = remote else {
+            // 不是远程 key：放回去，让正常 finish 路径处理。
+            self.operations[op_idx] = Some(op);
+            return Ok(None);
+        };
+        // 和 finish() 一致的前置校验，失败时 operation 已经摘掉（跟原行为一样）。
+        self.check_subsequent_auth(&op, auth_token, timestamp_token)?;
+        op.check_size(data.map_or(0, |v| v.len()))?;
+        let mut buf = match &op.crypto_op {
+            CryptoOperation::RemoteSign { data, .. } => data.clone(),
+            CryptoOperation::RemoteDecrypt { data, .. } => data.clone(),
+            _ => Vec::new(),
+        };
+        if let Some(input) = data {
+            buf.try_extend_from_slice(input)
+                .map_err(|_| km_err!(MemoryAllocationFailed, "remote finish buffer overflow"))?;
+        }
+        Ok(Some((is_sign, alias, algorithm, buf)))
+    }
+
     fn take_operation(&mut self, op_handle: OpHandle) -> Result<Operation, Error> {
         let op_idx = self.op_index(op_handle)?;
         Ok(self.operations[op_idx].take().unwrap(/* safe: op_index() checks */))

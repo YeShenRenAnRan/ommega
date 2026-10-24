@@ -1098,6 +1098,34 @@ impl KeyMintWrapper {
         let signature = signature.map(|s| s.to_vec());
         let confirmation_token = confirmation_token.map(|c| c.to_vec());
 
+        // 远程 key：锁内把待签数据取出来（TA 里的 operation 已经摘掉），锁外发网络。
+        // 远端签名是百毫秒级的请求，放在 KeyMintTa 的全局锁里会把别人的 begin 一起堵住，
+        // 检测器（TrustAttestor keystore_timing）量的就是“忙时 begin 慢不慢”。
+        let remote_job = {
+            let mut km = self.inner.keymint.lock().unwrap();
+            km.take_remote_finish(
+                op_handle,
+                input.as_deref(),
+                hardware_auth_token.clone(),
+                timestamp_token.clone(),
+            )
+            .map_err(kmerr_to_keystore)?
+        };
+        if let Some((is_sign, alias, algorithm, data)) = remote_job {
+            use kmr_ta::device::RemoteBackend;
+            let backend = crate::remote::RemoteRelayBackend;
+            let out = if is_sign {
+                backend
+                    .sign(&alias, &data, &algorithm)
+                    .map_err(kmerr_to_keystore)?
+            } else {
+                backend
+                    .decrypt(&alias, &data, &algorithm)
+                    .map_err(kmerr_to_keystore)?
+            };
+            return out.ok_or(Error::Km(ErrorCode::UNKNOWN_ERROR));
+        }
+
         let req = PerformOpReq::OperationFinish(FinishRequest {
             op_handle,
             input,
@@ -1135,6 +1163,15 @@ impl KeyMintWrapper {
         self.process_status_only(PerformOpReq::DeviceDeleteKey(DeleteKeyRequest {
             key_blob: key_blob.to_vec(),
         }))
+    }
+}
+
+fn kmerr_to_keystore(e: kmr_common::Error) -> Error {
+    // 把 TA 的错误折回 keystore 的编号：HAL 错误码按数值搬过去（两者枚举值一致），
+    // 其他（CBOR/内存分配等）当 UNKNOWN。
+    match e.kind() {
+        kmr_common::ErrorKind::Hal(code, _) => Error::Km(ErrorCode(*code as i32)),
+        _ => Error::Km(ErrorCode::UNKNOWN_ERROR),
     }
 }
 

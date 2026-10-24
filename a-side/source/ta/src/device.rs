@@ -232,6 +232,20 @@ pub struct RemoteAttestParams {
     /// 与 AOSP 的 `check_match` 语义一致：HAL 只签自己手里的真值，调用方报的值
     /// 对不上就回 `CannotAttestIds`。空 = 调用方没要求这一项。
     pub attestation_ids: Vec<(u32, Vec<u8>)>,
+    /// 调用方自带的证明密钥（App AttestKey 委派）。有值时这把 key 的证书必须由
+    /// B 端真 TEE 用那把已有的 ATTEST_KEY 原生签发，**不是**由本端软件 keybox 伪造。
+    pub attestation_key: Option<RemoteAttestationKey>,
+}
+
+/// 调用方指定的证据签发密钥在本端的引用（只留公开信息，私钥永远在 B）。
+#[derive(Debug, Clone)]
+pub struct RemoteAttestationKey {
+    /// 该 key 在 B 端 session 里的 alias。
+    pub alias: String,
+    /// 本端保存的公开钥（SPKI DER），用于校验回来的父证书就是这一把。
+    pub public_key: Vec<u8>,
+    /// 那把 key 自己的证书 Subject（DER X.501 Name），随请求下发。
+    pub issuer_subject_name: Vec<u8>,
 }
 
 /// there.  Each method returns `Ok(None)` when the remote is unavailable or not

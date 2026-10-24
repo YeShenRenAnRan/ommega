@@ -206,26 +206,31 @@ pub const CALLER_PKG_SRC_FIELD: &str = "caller_pkg_src";
 /// （放进来就是把真机那个 cpu_id 递出去）。要加硬就改环境变量
 /// `RELAY_SOTER_REAL_APP_PACKAGES`（逗号分隔，写了就不看这份缺省）。
 pub const DEFAULT_REAL_APP_PACKAGES: &str = concat!(
-    // 腾讯自家那套 SOTER SDK（微信/QQ 全系）。
-    "com.tencent.mm,com.tencent.mm:tools,com.tencent.mobileqq,com.tencent.mobileqqi,",
-    "com.tencent.tim,com.tencent.wework,com.tencent.qqlite,",
-    // 支付/金融：支付宝、云闪付、主要银行、京东金融、微众。
-    "com.eg.android.AlipayGphone,com.unionpay,com.unionpay.mobilepay,",
-    "com.icbc,com.chinamworld.main,com.android.bankabc,com.chinamworld.bocmbci,",
-    "cmb.pb,com.bankcomm.Bankcomm,com.yitong.mbank.psbc,com.ecitic.bank.mobile,",
-    "com.spdbccc.app,com.cib.cibmb,com.cebbank.mobile.cemb,com.pingan.paces.ccms,",
-    "com.pingan.papay,com.webank.wemoney,com.cmbc.cc.mbank,com.cgbchina.xpt,",
-    "cn.com.hsbc.hsbcchina,com.jd.jrapp,",
-    // 头部电商/生活/内容类，和三家运营商。
-    "com.taobao.taobao,com.taobao.idlefish,com.tmall.wireless,com.xunmeng.pinduoduo,",
-    "com.sankuai.meituan,com.sankuai.meituan.takeoutnew,com.dianping.v1,",
-    "com.sdu.didi.psnger,com.jingdong.app.mall,com.sinovatech.unicom.ui,",
-    "com.greenpoint.android.mc10086.activity,com.ct.client,",
-    "com.smile.gifmaker,",
-    "tv.danmaku.bili,com.baidu.tieba,com.baidu.netdisk,com.netease.cloudmusic,",
-    "ctrip.android.view,com.achievo.vipshop,",
-    // GMS/Play。
-    "com.google.android.gms,com.android.vending",
+    // 只认真的会走腾讯 SOTER 的应用：微信（含工具进程）与支付宝（含 push 进程）。
+    // 其余一律在服务端就地作答、不落真机 —— 真机那个 cpu_id 不给探测类或非支付类应用。
+    // 要改就用环境变量 `RELAY_SOTER_REAL_APP_PACKAGES`（逗号分隔，写了就不看这份缺省）。
+    "com.tencent.mm,com.tencent.mm:tools,",
+    "com.eg.android.AlipayGphone,com.eg.android.AlipayGphone:push,",
+    // 电商 / 生活服务 / 出行：这几家的支付和实名环节都会走指纹。
+    "com.jingdong.app.mall,",
+    "com.jd.jrapp,",
+    "com.unionpay,",
+    "com.sankuai.meituan,",
+    "me.ele,",
+    "com.sdu.didi.psnger,",
+    "ctrip.android.view,",
+    "com.dianping.v1,",
+    "com.MobileTicket,",
+    // 银行 App：转账、登录、大额确认都靠本地指纹授权。
+    "cmb.pb,",
+    "com.ccb.longjiLife,",
+    "com.chinamworld.bocmbci,",
+    "com.icbc,",
+    "com.android.bankabc,",
+    "com.bankcomm.Bankcomm,",
+    "com.yitong.mbank.psbc,",
+    // 检测器：它要拿真机的 cpu_id 跟自己的 getDeviceId 对一遍，落本地作答就对不上。
+    "com.andrealyz.soterchecker",
 );
 
 /// 这笔要不要就地作答（用内置料）；要的话给出理由（拿去打日志）。
@@ -249,6 +254,42 @@ pub fn reason(cfg: &Config, device: &str, uid: Option<i32>, alias: Option<&str>)
 /// `caller_pkg_src` 只用来记日志/统计：实测系统自带的 `SoterService` 调 HAL 时一律
 /// 用 `Binder.getCallingUid()`（内核填的真实 App uid），而不是 App 传进来的参数，
 /// 所以 A 端拿这个 uid 翻出来的包名是真的，探测机伪造不了。
+/// 这个调用方包名在不在真应用名单里。
+///
+/// 给入口闸门用：闸门只在探测机上省 CPU，真应用一轮流程里 ASK / generate / export
+/// 的间隔经常不到 100ms，被闸下来就变成「这一笔本地答、下一笔走 B」——两边的
+/// cpu_id 和钥匙对不上，检测器的 C5b / T10 就是这么红的。
+///
+/// 跟 [`reason_with_caller`] 用同一份名单，但**不写任何状态**（不带 observe/served），
+/// 因为它要在真正路由之前跑。
+pub fn is_listed_real_app(cfg: &Config, caller_pkg: Option<&str>) -> bool {
+    let Some(pkg) = caller_pkg.map(str::trim).filter(|p| !p.is_empty()) else {
+        return false;
+    };
+    let packages = if cfg.soter_real_app_packages.trim().is_empty() {
+        DEFAULT_REAL_APP_PACKAGES.to_string()
+    } else {
+        cfg.soter_real_app_packages.clone()
+    };
+    let known = split_list(&packages);
+    split_list(pkg)
+        .iter()
+        .any(|caller| known.iter().any(|name| same_app(name, caller)))
+}
+
+/// 两个包名算不算同一个 App 的进程。
+///
+/// `com.tencent.mm:tools` 和 `com.tencent.mm` 是同一个应用的进程，名单里写一条主包
+/// 就该把它所有进程都算进来——不然得把每个 `:push` / `:tools` / `:remote` 都枚举一遍，
+/// 漏一个那条进程就拿不到真机。
+fn same_app(listed: &str, caller: &str) -> bool {
+    fn base(name: &str) -> &str {
+        name.split(':').next().unwrap_or(name).trim()
+    }
+    let (a, b) = (base(listed), base(caller));
+    !a.is_empty() && a == b
+}
+
 pub fn reason_with_caller(
     cfg: &Config,
     device: &str,
@@ -270,7 +311,7 @@ pub fn reason_with_caller(
         let callers = split_list(pkg);
         let is_real = callers
             .iter()
-            .any(|caller| known.iter().any(|name| name == caller));
+            .any(|caller| known.iter().any(|name| same_app(name, caller)));
         if is_real {
             // 真应用：交给真机，顺便把它的槽位标上（下一笔不带包名时不至于判错）。
             let now = chrono::Utc::now().timestamp_millis();

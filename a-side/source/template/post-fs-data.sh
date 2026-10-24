@@ -10,6 +10,11 @@ TARGET_INJECTOR_CONFIG=$TARGET_DIR/injector.toml
 TARGET_CONF=$TARGET_DIR/config
 TARGET_TARGET_LIST=$TARGET_DIR/target.txt
 STATE_DIR=/data/adb/ommega
+BIN_DIR=$STATE_DIR/bin
+CONF_DIR=$STATE_DIR/conf
+RUN_DIR=$STATE_DIR/run
+DB_DIR=$STATE_DIR/db
+[ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
 # A-side config directory (webroot UI writes here; `ommegadata` is a symlink to
 # $TARGET_DIR, so the UI and the keystore process (uid 1017) share one copy).
 CLIENTA_DIR=/data/adb/ommega
@@ -18,7 +23,7 @@ CLIENTA_DIR=/data/adb/ommega
 # customize.sh 安装时会把与设备 ABI 匹配的那份拷到状态目录）。以前靠管理器提供：
 # Magisk 自带、APatch/KSU 走 busybox/ksud，不是每家都有、行为也不一致，所以不再依赖。
 # 定成同名函数，下面那一串调用一字不用改；实在找不到自己的才退回 PATH 里那个。
-RESETPROP_BIN=/data/adb/ommega/resetprop
+RESETPROP_BIN=$BIN_DIR/resetprop
 if [ ! -x "$RESETPROP_BIN" ]; then
   rp_abi=$(getprop ro.product.cpu.abi 2>/dev/null)
   case "$rp_abi" in
@@ -52,19 +57,29 @@ resetprop ro.adb.secure 1
 resetprop ro.debuggable 0
 resetprop sys.oem_unlock_allowed ""
 resetprop ro.secureboot.devicelock 1
+
+# 开机时就把 B 真机声明的身份对齐到本机（文件由 TA 在远程出链时写入）：
+# 链是真机出的，本机属性必须说同一台机器，否则检测器报 device_properties /
+# VBMeta 摘要不一致。daemon 运行期也会再同步一次（带 zygote 软重启）。
+_OMMEGA_IDENTITY=/data/misc/keystore/ommega/remote_identity
+if [ -f "$_OMMEGA_IDENTITY" ]; then
+  _id_set() {
+    [ -n "$1" ] && [ -n "$2" ] && resetprop "$1" "$2"
+  }
+  _id_get() { sed -n "s/^$1=//p" "$_OMMEGA_IDENTITY" 2>/dev/null | head -n1; }
+  _id_set ro.product.brand "$(_id_get brand)"
+  _id_set ro.product.device "$(_id_get device)"
+  _id_set ro.product.name "$(_id_get product)"
+  _id_set ro.product.manufacturer "$(_id_get manufacturer)"
+  _id_set ro.product.model "$(_id_get model)"
+  _id_set ro.serialno "$(_id_get serial)"
+  _id_set ro.boot.vbmeta.digest "$(_id_get vbmeta_digest)"
+fi
 mkdir -p "$TARGET_DIR"
 chmod 0770 "$TARGET_DIR"
 chown 1017:1017 "$TARGET_DIR"
-mkdir -p "$LOG_DIR"
-chmod 0770 "$LOG_DIR"
-chown 1017:1017 "$LOG_DIR"
-mkdir -p "$APP_LOG_DIR"
-chmod 0770 "$APP_LOG_DIR"
-chown 0:1000 "$APP_LOG_DIR"
-mkdir -p "$STATE_DIR"
-rm -f "$STATE_DIR/keymint-daemon.pid" "$STATE_DIR/injector-daemon.pid"
-
-# 「启用调试日志」关着时本脚本一条都不打：post-fs-data 的输出也会进管理器的日志。
+# 「启用调试日志」关着时不要建任何日志目录：以前无条件 mkdir，用户关着日志也会
+# 多出两个空空的 logs 目录。真正的写日志在 `log_line` 里还要再判一次。
 debug_logging_enabled() {
   [ -f "$TARGET_CONF" ] || return 1
   val=$(sed -n 's/^[[:space:]]*\(debug_logging\|debug\|verbose\)[[:space:]]*:[[:space:]]*\(.*\)$/\2/p' "$TARGET_CONF" 2>/dev/null | head -n1 | tr -d ' \r' | tr 'A-Z' 'a-z')
@@ -73,6 +88,16 @@ debug_logging_enabled() {
   esac
   return 1
 }
+if debug_logging_enabled; then
+  mkdir -p "$LOG_DIR"
+  chmod 0770 "$LOG_DIR"
+  chown 1017:1017 "$LOG_DIR"
+  mkdir -p "$APP_LOG_DIR"
+  chmod 0770 "$APP_LOG_DIR"
+  chown 0:1000 "$APP_LOG_DIR"
+fi
+mkdir -p "$STATE_DIR"
+rm -f "$RUN_DIR/keymint-daemon.pid" "$RUN_DIR/injector-daemon.pid"
 
 # 只落文件，不再往 stdout 打（那会进管理器的日志，也是系统日志）。
 log_line() {
@@ -81,7 +106,7 @@ log_line() {
   printf '%s [INFO] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null
   return 0
 }
-rm -f "$STATE_DIR/restart.keymint" "$STATE_DIR/restart.injector" "$STATE_DIR/restart.all"
+rm -f "$RUN_DIR/restart.keymint" "$RUN_DIR/restart.injector" "$RUN_DIR/restart.all"
 
 # Make the shared A-side config directory traversable and expose the data dir.
 mkdir -p "$CLIENTA_DIR"
@@ -167,6 +192,16 @@ fi
 # 运行期那条路（daemon 启动时写）保留，管的是我们自己铸链用的 ctx。
 # 只有显式写了值才动；auto 一律保持设备原值。
 DECLARED_CONF=$TARGET_DIR/config.toml
+# 只在设备本来就有这个属性时才改。
+#
+# 凭空造一个新属性比不改更糟：检测器一看「这型号怎么会有这个键」就露了，
+# 而且 resetprop 造出来的值也不会被所有读取方认。所以凡是「改」都先确认真有；
+# 没有就跳过，让链上那份自己去算。
+setprop_if_present() {
+  [ -n "$(getprop "$1" 2>/dev/null)" ] || return 0
+  resetprop "$1" "$2"
+}
+
 if [ -f "$DECLARED_CONF" ]; then
   # cfg_val <key>：取 config.toml 里 "key = \"value\"" 的 value（[trust] 下的键）
   cfg_val() {
@@ -176,30 +211,33 @@ if [ -f "$DECLARED_CONF" ]; then
   # 没单写就跟着 security_patch 走，跟 Rust 侧 resolve_patch_levels 的继承顺序一致
   d_os=$(cfg_val os_patchlevel); [ "$d_os" = auto ] && d_os=$d_patch
   d_vendor=$(cfg_val vendor_patchlevel); [ "$d_vendor" = auto ] && d_vendor=$d_patch
-  # boot 不继承：设备原本没这个属性，凭空造一个反而多一处马脚，只认显式声明
+  # boot 不继承，也不推导：设备原本没这个属性就不造（凭空造一个反而多一处马脚）。
+  # 链上的 boot 补丁级别由 keymint 运行时按 boot 镜像日期算，不靠这个属性。
   d_boot=$(cfg_val boot_patchlevel)
   for pair in "$d_os|ro.build.version.security_patch" "$d_vendor|ro.vendor.build.security_patch" "$d_boot|ro.vendor.boot_security_patch"; do
     value=${pair%%|*}
     prop=${pair##*|}
     case "$value" in ""|auto) continue ;; esac
-    resetprop "$prop" "$value"
+    setprop_if_present "$prop" "$value"
     log_line "ommega: declared $prop=$value (boot stage)"
   done
+  # 引导器锁定状态：不少检测器会看。只有真的存在这个键的机型才改。
+  setprop_if_present ro.secureboot.lockstate locked
   d_vbkey=$(cfg_val vb_key)
-  case "$d_vbkey" in ""|auto|random) ;; *) resetprop ro.boot.vbmeta.public_key_digest "$d_vbkey"; log_line "ommega: declared vbmeta key (boot stage)" ;; esac
+  case "$d_vbkey" in ""|auto|random) ;; *) setprop_if_present ro.boot.vbmeta.public_key_digest "$d_vbkey"; log_line "ommega: declared vbmeta key (boot stage)" ;; esac
   d_vbhash=$(cfg_val vb_hash)
-  case "$d_vbhash" in ""|auto|random) ;; *) resetprop ro.boot.vbmeta.digest "$d_vbhash"; log_line "ommega: declared vbmeta hash (boot stage)" ;; esac
+  case "$d_vbhash" in ""|auto|random) ;; *) setprop_if_present ro.boot.vbmeta.digest "$d_vbhash"; log_line "ommega: declared vbmeta hash (boot stage)" ;; esac
   unset d_patch d_os d_vendor d_boot d_vbkey d_vbhash
 fi
 
 # ---- 面板里设的属性覆盖 ----
-# 单独存一份（$STATE_DIR/props.conf），**不写进这个脚本**：模块一升级，这个脚本
+# 单独存一份（$CONF_DIR/props.conf），**不写进这个脚本**：模块一升级，这个脚本
 # 就被新版本整个替掉，写在里面的设置会跟着没（以前就是这么丢的）。
 #
 # 放在最后应用：它是用户在面板上明确点的，优先级高于上面那套默认值和 config.toml
 # 里的开机期声明。一行一项 `键: 值`；值可以带引号，不带空格；**空值 = 不覆盖**
 # （那一项就由模块自己的默认值决定）。
-PROP_OVERRIDES=$STATE_DIR/props.conf
+PROP_OVERRIDES=$CONF_DIR/props.conf
 if [ -r "$PROP_OVERRIDES" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ''|'#'*) continue ;; esac
@@ -216,53 +254,125 @@ if [ -r "$PROP_OVERRIDES" ]; then
       *) continue ;;
     esac
     [ -n "$p_val" ] || continue
-    resetprop "$p_key" "$p_val"
+    setprop_if_present "$p_key" "$p_val"
     log_line "ommega: override $p_key=$p_val (boot stage)"
   done < "$PROP_OVERRIDES"
 fi
 
-# ---- "声明不支持 StrongBox"（flat config 键 hide_strongbox）----
+# ---- 能力声明隐藏（flat config 键 hide_strongbox / hide_device_ids）----
 # 挂载完全交给 root 管理器（Magisk magic mount / KernelSU overlayfs）：
 # customize.sh 安装时按设备实际情况在模块 system/<分区>/etc/permissions/ 下
-# 放置了 0:0 dummy 设备（whiteout），管理器开机挂载时据此删掉对应的
-# strongbox_keystore feature XML，PackageManager 即报不支持；keystore 守护
-# 进程（Rust 侧）读同一开关决定是否注册 STRONGBOX security level（config
-# watcher 热生效）。这里只按开关增删标记文件，改动下次重启生效。
-WL_NAME="android.hardware.security.strongbox_keystore.xml"
-# 每项是"模块 system/ 底下的相对路径"：/system 自己不带分区前缀，其余分区要带。
+# 放置了 0:0 dummy 设备（whiteout），管理器开机挂载时据此删掉对应的 feature
+# XML，PackageManager 即报不支持；keystore 守护进程（Rust 侧）读同一开关决定
+# 是否注册 STRONGBOX security level（config watcher 热生效）。这里只按开关
+# 增删标记文件，改动下次重启生效。
+#
+# 两个开关共用这套机制：
+#   hide_strongbox   → android.hardware.security.strongbox_keystore.xml
+#   hide_device_ids  → android.software.device_id_attestation.xml
+# 后者声明「不支持 ID 认证」之后，应用/检测器会整体跳过设备 ID 证明（而不是每笔
+# 都回 CannotAttestIds），也就不需要再把本机型号/品牌同步成远端那台机器。
 WL_RELS="vendor/etc/permissions product/etc/permissions system_ext/etc/permissions etc/permissions"
-hide_strongbox=false
-if [ -f "$TARGET_CONF" ]; then
-  hide_value=$(grep -iE '^[[:space:]]*(hide_strongbox|no_strongbox|hide_strongbox_keystore)[[:space:]]*:' "$TARGET_CONF" 2>/dev/null | head -n 1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
-  case "$hide_value" in
-    1|true|yes|on) hide_strongbox=true ;;
-  esac
-  unset hide_value
-fi
-for rel in $WL_RELS; do
-  marker="$MODDIR/system/$rel/$WL_NAME"
-  # 换算回系统里的真实路径：vendor 那种自带分区前缀，system 的要补上
-  case "$rel" in
-    vendor/*|product/*|system_ext/*) src_file="/$rel/$WL_NAME" ;;
-    *) src_file="/system/$rel/$WL_NAME" ;;
-  esac
-  if [ "$hide_strongbox" = true ]; then
-    # 系统里真实存在声明、且模块还没有标记时补建（覆盖安装后才出现声明、
-    # 或曾被关闭删掉的情形）；设备上不存在的分区路径自然跳过，零副作用
-    [ -f "$src_file" ] || continue
-    [ -e "$marker" ] && continue
-    mkdir -p "$MODDIR/system/$rel"
-    if mknod "$marker" c 0 0 2>/dev/null; then
-      log_line "ommega: hide_strongbox on; whiteout restored at $rel"
-    elif printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions/>\n' > "$marker" 2>/dev/null; then
-      log_line "ommega: hide_strongbox on; overlay restored at $rel"
-    fi
-  elif [ -e "$marker" ]; then
-    rm -f "$marker"
-    log_line "ommega: hide_strongbox off; whiteout removed from $rel"
+
+# mask_feature <feature xml 文件名> <配置键...>
+mask_feature() {
+  mf_name=$1
+  shift
+  mf_enabled=false
+  if [ -f "$TARGET_CONF" ]; then
+    mf_pat=$(printf '%s|' "$@")
+    mf_pat=${mf_pat%|}
+    mf_value=$(grep -iE "^[[:space:]]*(${mf_pat})[[:space:]]*:" "$TARGET_CONF" 2>/dev/null | head -n 1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+    case "$mf_value" in
+      1|true|yes|on) mf_enabled=true ;;
+      0|false|no|off) mf_enabled=false ;;
+      # 没写这个键时看调用方的默认值：device_id 那一项默认关，strongbox 默认关。
+      *) [ "${OMMEGA_MASK_DEFAULT:-0}" = "1" ] && mf_enabled=true ;;
+    esac
   fi
-done
-unset WL_NAME WL_RELS hide_strongbox
+  for mf_rel in $WL_RELS; do
+    mf_marker="$MODDIR/system/$mf_rel/$mf_name"
+    # 换算回系统里的真实路径：vendor 那种自带分区前缀，system 的要补上
+    case "$mf_rel" in
+      vendor/*|product/*|system_ext/*) mf_src="/$mf_rel/$mf_name" ;;
+      *) mf_src="/system/$mf_rel/$mf_name" ;;
+    esac
+    if [ "$mf_enabled" = true ]; then
+      # 系统里真实存在声明、且模块还没有标记时补建（覆盖安装后才出现声明、
+      # 或曾被关闭删掉的情形）；设备上不存在的分区路径自然跳过，零副作用
+      [ -f "$mf_src" ] || continue
+      [ -e "$mf_marker" ] && continue
+      mkdir -p "$MODDIR/system/$mf_rel"
+      if mknod "$mf_marker" c 0 0 2>/dev/null; then
+        log_line "ommega: $mf_name hidden; whiteout restored at $mf_rel"
+      elif printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions/>\n' > "$mf_marker" 2>/dev/null; then
+        log_line "ommega: $mf_name hidden; overlay restored at $mf_rel"
+      fi
+    elif [ -e "$mf_marker" ]; then
+      rm -f "$mf_marker"
+      log_line "ommega: $mf_name shown again; marker removed from $mf_rel"
+    fi
+  done
+
+  # 挂载层的兜底：管理器没给这个分区做 overlay（这台 KernelSU 3.3 就只覆盖 /system，
+  # `/vendor` 是独立 erofs、`/system/vendor` 只是软链）—— 那 whiteout 白种了。
+  # 不再把 /data 里的文件 bind 到 /vendor 的那个 XML 上：那条挂载在 mountinfo 里长
+  # 这样 `... /adb/ommega/empty_permissions.xml /vendor/etc/permissions/xxx.xml ...
+  # f2fs`，连源路径都写着，用户态一眼看出来。这里改成：先在 /mnt/vendor/ 下挂一个
+  # 小 tmpfs（看起来像 OEM 自己挂的），里面放一个空 `<permissions/>`，再把这个
+  # **单文件** bind 到真实 XML 上。
+  #
+  # 只盖这一个文件，**绝不动目录**：早先试过把整目录 bind 成暂存副本，结果那个
+  # 暂存目录的目录标签/挂载参数跟 system_server 期望的不一致，PackageManager 读不
+  # 到权限 XML，框架直接起不来、卡开机。一个文件被盖，旁边 59 个 XML 还是原样。
+  if [ "$mf_enabled" = true ]; then
+    mf_fake_base=${OMMEGA_FAKE_MOUNT_BASE:-/mnt/vendor/vendor_permissions}
+    for mf_rel in $WL_RELS; do
+      case "$mf_rel" in
+        vendor/*|product/*|system_ext/*) mf_src="/$mf_rel/$mf_name" ;;
+        *) mf_src="/system/$mf_rel/$mf_name" ;;
+      esac
+      mf_dir=$(dirname "$mf_src")
+      [ -f "$mf_src" ] || continue
+      # overlay 真生效时这里已经是 whiteout 设备或空声明，不用再盖
+      grep -q '<permissions/>' "$mf_src" 2>/dev/null && continue
+      grep -q " $mf_src " /proc/mounts 2>/dev/null && continue
+
+      if ! grep -q " $mf_fake_base " /proc/mounts 2>/dev/null; then
+        mkdir -p "$mf_fake_base" 2>/dev/null
+        mount -t tmpfs -o mode=0755,seclabel tmpfs "$mf_fake_base" 2>/dev/null || {
+          log_line "ommega: tmpfs mount for $mf_fake_base failed; mask skipped"
+          continue
+        }
+      fi
+      # 暂存文件名别把目标写进去：mountinfo 里会原样显示挂载根的路径，
+      # 写 `_vendor_etc_permissions_android.software.device_id_attestation.xml`
+      # 等于自己把“我遮了哪个文件”写在脸上。
+      mf_stage="$mf_fake_base/vendor.conf"
+      printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions/>\n' > "$mf_stage" 2>/dev/null || continue
+      chmod 0644 "$mf_stage" 2>/dev/null
+      case "$mf_src" in
+        /vendor/*) chcon u:object_r:vendor_file:s0 "$mf_stage" 2>/dev/null ;;
+        *) chcon u:object_r:system_file:s0 "$mf_stage" 2>/dev/null ;;
+      esac
+      if mount --bind "$mf_stage" "$mf_src" 2>/dev/null; then
+        # 不再 remount,ro：那个 ro 只会落在其中一个挂载命名空间（init 这份），
+        # 而 shared:43 传播出去的另一份还是 rw —— 结果是同一个文件在不同进程的
+        # mountinfo 里一个 ro 一个 rw，DuckDetector 的「跨进程视图对比」正好拿这个
+        # 当“选择性隐藏”报出来（2026-10-23 实测：两份签名，分属 325 / 623 个进程）。
+        # 而它真正会报的 “System RW” 只判 target 完全等于 /vendor 的挂载，
+        # 文件级 bind 根本不在那条规则里，所以 ro 没赚到任何东西。
+        log_line "ommega: $mf_name masked by $mf_stage over $mf_src"
+      else
+        log_line "ommega: bind for $mf_src failed; feature stays visible"
+      fi
+    done
+  fi
+}
+
+OMMEGA_MASK_DEFAULT=0 mask_feature android.hardware.security.strongbox_keystore.xml hide_strongbox no_strongbox hide_strongbox_keystore
+OMMEGA_MASK_DEFAULT=0 mask_feature android.software.device_id_attestation.xml hide_device_ids no_device_ids hide_device_id_attestation
+unset WL_RELS mf_name mf_enabled mf_pat mf_value mf_rel mf_marker mf_src
 
 # ── 尽早把两个守护拉起来 ─────────────────────────────────────────────────
 # 为什么抢在 post-fs-data（最早那个阶段）而不是 service.sh（late_start）：注入 keystore2
@@ -304,14 +414,14 @@ start_daemon_early() {
 }
 
 if [ -f "$MODDIR/daemon" ]; then
-  if start_daemon_early "$MODDIR/daemon" "$STATE_DIR/keymint-daemon.pid"; then
+  if start_daemon_early "$MODDIR/daemon" "$RUN_DIR/keymint-daemon.pid"; then
     log_line "ommega: keymint daemon started early in post-fs-data"
   else
     log_line "ommega: keymint daemon early start failed; service.sh will retry"
   fi
 fi
 if [ -f "$MODDIR/daemon-injector" ]; then
-  if start_daemon_early "$MODDIR/daemon-injector" "$STATE_DIR/injector-daemon.pid"; then
+  if start_daemon_early "$MODDIR/daemon-injector" "$RUN_DIR/injector-daemon.pid"; then
     log_line "ommega: injector daemon started early in post-fs-data"
   else
     log_line "ommega: injector daemon early start failed; service.sh will retry"

@@ -31,7 +31,12 @@ pub(crate) fn answer(call: &SoterCall) -> Option<Answer> {
     }
 }
 
-/// 问 daemon 这笔该怎么答。问不到一律按本地兜底处理。
+/// 问 daemon 这笔该怎么答。
+///
+/// 只能由 daemon 决定走真机、服务端还是本地兜底 —— 它才是看「远程 keymint」开关和
+/// 真应用名单的那一方（宿主读不到上那份 0770 的配置）。所以**问不到的时候不能默认
+/// 本地**：白名单内的真应用本该由 B 签，一旦这里偷偷拿 A 端自己的料签，同一轮里
+/// `cpu_id` 和密钥就会一半来自 A、一半来自 B（检测器的 C5b / T10 就是这么红的）。
 fn resolve(call: &SoterCall) -> Outcome {
     let Some(request) = request(call) else {
         // 号码不在转发表里（空号、app 侧那套号码）：老规矩，本地能答就本地答。
@@ -42,17 +47,20 @@ fn resolve(call: &SoterCall) -> Outcome {
     let cache_key = cache_slot(call);
     if let Some(key) = cache_key.as_deref() {
         if let Some(blob) = cache_get(key) {
-            return Outcome::decode(&blob).unwrap_or(Outcome::Local);
+            return Outcome::decode(&blob).unwrap_or(Outcome::Passthrough);
         }
     }
     let blob = match crate::ipc::forward_soter(&request) {
         Ok(blob) => blob,
         Err(error) => {
-            debug!("event=soter relay unavailable ({error:#}); using the local backend");
-            return Outcome::Local;
+            debug!(
+                "event=soter relay unavailable ({error:#}); passing through instead of \
+                 signing locally"
+            );
+            return Outcome::Passthrough;
         }
     };
-    let outcome = Outcome::decode(&blob).unwrap_or(Outcome::Local);
+    let outcome = Outcome::decode(&blob).unwrap_or(Outcome::Passthrough);
     match cache_key {
         Some(key) => cache_put(&key, &blob, &outcome),
         None => cache_clear(),

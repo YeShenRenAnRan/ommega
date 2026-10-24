@@ -75,6 +75,7 @@ REQUIRED_TEMPLATE_FILES = (
     "daemon",
     "daemon-injector",
     "injector.toml",
+    "layout.sh",
     "module.prop",
     "post-fs-data.sh",
     "service.sh",
@@ -91,6 +92,7 @@ MODULE_TEXT_FILES = (
     "daemon-injector",
     "injector.toml",
     "keybox.xml",
+    "layout.sh",
     "module.prop",
     "post-fs-data.sh",
     "sepolicy.rule",
@@ -157,7 +159,7 @@ def get_version() -> str:
 # 1.6.9+0 = 1006009）—— 管理器会当成降级，1.6.9 根本推不下去。所以换版本号也
 # 只能接着往上加：必须 > 线上那颗 1006026，18 刚好到 1006027。
 # 这个数跟 b-side 各算各的，别顺手对齐。
-VERSION_CODE_OFFSET = 31
+VERSION_CODE_OFFSET = 58
 
 
 def version_code(version: str) -> str:

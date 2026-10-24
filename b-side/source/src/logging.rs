@@ -3,13 +3,18 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use log::LevelFilter;
 
-const DEFAULT_LOG_PATH: &str = "/data/adb/ommega/logs/relay.log";
-const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
+const DEFAULT_LOG_PATH: &str = "/data/adb/ommega-b/logs/relay.log";
+/// 时间 | 级别 | pid/tid | 模块 | 消息。
+///
+/// 这个文件是好几个线程共写的（relay 主循环、hal_restart 的重试、keymaster 转发），
+/// 不带 pid/tid 就分不清“哪行是哪个阶段写的”，而排查时最需要的正是这个。
+/// 跟 A 端 `logging.rs` 的 PATTERN 保持同形。
+const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)(utc)} [{h({l})}] [{P}/{T}] {M} - {m}{n}";
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 
 /// Initialize the relay logger. All log sinks are controlled from the single
-/// config file (`/data/adb/ommega/relay.conf`) via the `OMMEGA_RELAY_LOG_*`
+/// config file (`/data/adb/ommega-b/relay.conf`) via the `OMMEGA_RELAY_LOG_*`
 /// and `OMMEGA_RELAY_LOGCAT_*` keys:
 ///
 /// * `file_enabled` + `file_level` — on-disk log at `DEFAULT_LOG_PATH`
@@ -40,7 +45,7 @@ fn init_logger_inner(
     logcat_enabled: bool,
     logcat_level: LevelFilter,
 ) -> Result<()> {
-    // Ensure the log directory exists (e.g. /data/adb/ommega/logs). Created as
+    // Ensure the log directory exists (e.g. /data/adb/ommega-b/logs). Created as
     // root by the relay daemon; failure is non-fatal (logcat still works).
     if let Some(dir) = std::path::Path::new(DEFAULT_LOG_PATH).parent() {
         let _ = std::fs::create_dir_all(dir);

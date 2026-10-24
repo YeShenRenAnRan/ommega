@@ -2,10 +2,15 @@
 
 MODDIR=${0%/*}
 STATE_DIR=/data/adb/ommega
-PAYLOAD_STATE_FILE=$STATE_DIR/injector.payload
-RESTART_FILE=$STATE_DIR/restart.injector
-PEER_RESTART_FILE=$STATE_DIR/restart.keymint
-RESTART_ALL_FILE=$STATE_DIR/restart.all
+BIN_DIR=$STATE_DIR/bin
+CONF_DIR=$STATE_DIR/conf
+RUN_DIR=$STATE_DIR/run
+DB_DIR=$STATE_DIR/db
+[ -f "$MODDIR/layout.sh" ] && . "$MODDIR/layout.sh" 2>/dev/null
+PAYLOAD_STATE_FILE=$CONF_DIR/injector.payload
+RESTART_FILE=$RUN_DIR/restart.injector
+PEER_RESTART_FILE=$RUN_DIR/restart.keymint
+RESTART_ALL_FILE=$RUN_DIR/restart.all
 
 # A 端平铺 config（WebUI 写的），只有 soter_inject 这个键是本脚本读的：
 # 关着（键不在、或写了 0/false）就完全不碰 SOTER 宿主——不起服务、不注入；
@@ -66,8 +71,8 @@ device_abi() {
 }
 
 find_module_injector() {
-  if [ -f "$STATE_DIR/ommega-inject" ]; then
-    echo "$STATE_DIR/ommega-inject"
+  if [ -f "$BIN_DIR/ommega-inject" ]; then
+    echo "$BIN_DIR/ommega-inject"
     return 0
   fi
   if [ -f "$MODDIR/ommega-inject" ]; then
@@ -461,6 +466,8 @@ retry_cooldown=15
 soter_start_attempted=0
 # 宿主保活用的节流：宿主不在时最多每 30 秒拉起一次，别每拍都去 am start-service。
 last_soter_start_at=0
+# SOTER 的 HIDL 客户端（cryptoeng 这种）多久点一次注入。
+last_soter_hidl_at=0
 # 第一次看到「宿主在跑但没注上」的时刻（epoch 秒），注完把间隔写进日志。
 soter_seen_at=
 last_soter_pid=
@@ -488,7 +495,7 @@ tick_sleep() {
 
 # 单实例：同 daemon 那层 —— service.sh 的看门循环可能同时存在多份，每份 fork 一个
 # 注入器；多份并存时每轮都会 pkill 掉对方正在用的 keystore2/注入进程。抢不到锁就退。
-LOCK_DIR=$STATE_DIR/injector-daemon.lock
+LOCK_DIR=$RUN_DIR/injector-daemon.lock
 
 # 同 daemon 那层：pid 复用会让锁看着「一直有人」，光 kill -0 不够，还要确认是本脚本。
 holder_is_us() {
@@ -550,6 +557,18 @@ while true; do
     continue
   fi
 
+  # SOTER 的 HIDL 客户端（一加的 cryptoeng 这类产线/工程模式工具）得单独注一次：
+  # 它们调的是 `vendor.qti.hardware.soter@1.0::ISoter`，跟宿主那条 AIDL 路不是一套，
+  # 不注进去，工程模式那页的 SOTER 项就一直吃原厂 TA 的 -20。injector 自己是幂等的
+  # （已经注过的目标会直接跳过），所以每 60 秒点一次就够，不用在这里做发现。
+  if soter_inject_enabled; then
+    now_hidl=$(date +%s 2>/dev/null || echo 0)
+    if [ "$now_hidl" -gt 0 ] && [ $((now_hidl - last_soter_hidl_at)) -ge 60 ]; then
+      last_soter_hidl_at=$now_hidl
+      OMMEGA_INJECT_TARGETS=soter-hidl "$TARGET_INJECTOR" >/dev/null 2>&1
+    fi
+  fi
+
   if consume_restart_request; then
     pending_restart=1
     restart_keystore "$(get_keystore_pid)"
@@ -560,10 +579,18 @@ while true; do
   fi
 
 
-  # SOTER 不再注入宿主：改成接管 HAL 的服务名（见 soterta.sh）。宿主发出去的请求
-  # 只要打到我们的服务，效果一样；而在这台机型上宿主里的载荷根本装不上 —— 它的
-  # libbinder 带共享映射，lsplt 连一个 GOT 都认不下来，commit 全失败。
-  inject_targets=keystore2
+  # SOTER 走哪条路决定注不注宿主：
+  # - AIDL 平台（如 PLC110）：我们自己顶服务名，宿主手里的代理会失效、由 soterta.sh 踢它
+  #   重连；宿主里的载荷用不上，ptrace 去装一次反而浪费。
+  # - HIDL 平台（如 MEIZU 20 Pro / 骁龙 8 Gen2，`vendor.qti.hardware.soter@1.0::ISoter`）：
+  #   客户端走 hwservicemanager，我们顶不了那个名字，只能注进宿主，在它进程里把发往
+  #   HAL 的那笔截下来自己答（hook/soter.rs 按 HIDL 布局回包）。不注就等于没接管，
+  #   原厂 TA 死着的时候整族调用 -20。
+  if [ "$(sh "$MODDIR/soterta.sh" hidl 2>/dev/null | tr -d ' \r')" = "1" ] && soter_inject_enabled; then
+    inject_targets=keystore2,soter
+  else
+    inject_targets=keystore2
+  fi
 
   pid=$(get_keystore_pid)
   keystore_pending=0

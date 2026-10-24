@@ -1,4 +1,4 @@
-pub const SOCKET: &str = "/data/adb/ommega/rpc.sock";
+pub const SOCKET: &str = "/data/adb/ommega-b/rpc.sock";
 pub const WIRE_MAX_VERSION: u32 = 2;
 
 pub const SERVICE: &str = "ommega";

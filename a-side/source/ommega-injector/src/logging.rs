@@ -5,12 +5,22 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Result;
 use log::LevelFilter;
 
-const DEFAULT_LOG_PATH: &str = "/data/misc/keystore/ommega/logs/injector.log";
-/// payload 落进 app 域时的后备：上面那个目录属于 keystore（0770），SOTER 宿主
-/// 是 uid 1000，连开都开不了。这个位置由 daemon-injector 建好、权限给到 system
-/// 组，system_app 写得动。
-const APP_DOMAIN_LOG_PATH: &str = "/data/misc/ommega/logs/injector.log";
-const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S %Z)(utc)} [{h({l})}] {M} - {m}{n}";
+/// 唯一的日志位置。
+///
+/// 必须落在 `/data/misc/ommega/logs/`：注入后的 payload 跟 SOTER 宿主（uid 1000，
+/// system_app）和 HAL 进程跑在同一个地址空间里，只有这个目录的 `system_app_data_file`
+/// 标签它们写得进去。`/data/adb` 是 `adb_data_file`（只有 root 能开），
+/// `/data/misc/keystore` 是 0700 keystore，宿主和 HAL 都开不了。
+const LOG_PATH: &str = "/data/misc/ommega/logs/injector.log";
+/// 保留两个旧名字，指向同一个位置：`init_logger_inner` 的循环和
+/// `loosen_app_domain_path` 的判断都还按「两个候选」写，路径一致后第一个就成、直接返回。
+const DEFAULT_LOG_PATH: &str = LOG_PATH;
+const APP_DOMAIN_LOG_PATH: &str = LOG_PATH;
+/// 时间 | 级别 | pid/tid | 模块 | 消息。
+///
+/// pid/tid 是必需的：这个文件是好几个进程（注入器、SOTER 宿主、SOTER HAL）共写的，
+/// 不带 pid 就只能从消息内容猜是谁写的，而「到底哪个进程没注入成功」正是要查的事。
+const PATTERN: &str = "{d(%Y-%m-%d %H:%M:%S)(utc)} [{h({l})}] [{P}/{T}] {M} - {m}{n}";
 
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 /// 实际装上 logger 的那个位置（两个候选里先成的那个）。给诊断用：用 `entry` 里
@@ -136,11 +146,11 @@ pub fn init_logger_fallback(level: LevelFilter) {
 
 fn init_logger_inner(configured_level: LevelFilter) -> Result<()> {
     // 只落文件。不用 logcat：那条线在 app 域里本来就不可靠，而且 A 端的日志
-    // 统一走文件。目录有两个候选，哪个先装上就用哪个。
+    // 统一走文件。两个候选现在指向同一个位置（见 [`LOG_PATH`]），第一个就成了。
     //
-    // 每个候选都单独试、失败就接着下一个：SOTER 宿主是 uid 1000，进不去
-    // keystore 那个 0770 目录，但它自己那份位置是能写的（那个目录的 SELinux
-    // 标签必须是 system_app_data_file，由 daemon-injector 负责打）。
+    // 先自己开一次，只为了把 errno 记下来：appender 那边把错误咽了（只 eprintln，
+    // 而注入进去的进程 stderr 根本没人看），光靠“没写出来”分不清是 DAC、SELinux
+    // 还是路径本身不对。这份探针文本会顺 RPC 报给 daemon。
     let mut last_error: Option<anyhow::Error> = None;
     let mut probes: Vec<String> = Vec::new();
     for (label, path) in [("keystore", DEFAULT_LOG_PATH), ("app", APP_DOMAIN_LOG_PATH)] {

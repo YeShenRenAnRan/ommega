@@ -52,6 +52,11 @@ use crate::statedb;
 const OK: i32 = 0;
 /// "这把钥匙不在这台设备上"。实测 `hasAskAlready(10371)` 就返回它。
 const NOT_FOUND: i32 = -5;
+/// AuthKey 还没建（`has_auth_key` / `export_auth_key_public_key` 查不到时）。
+/// 真机 TA 这里答 -6（AUTH_KEY_NOT_READY），答 -5 会被当成「ASK 没建」。
+const AUTH_KEY_NOT_READY: i32 = -6;
+/// `finish_sign` 拿到一个不存在的 session。真机 TA 用 -1000，不是 -5。
+const SESSION_UNKNOWN: i32 = -1000;
 /// ASK 里写死的盐长，SHA-256 摘要长度。
 const ASK_SALT_LEN: i32 = 32;
 
@@ -686,7 +691,11 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
             "get_device_id" => {
                 // 带上层名：A 端要靠它分辨这个号是真机报的还是服务端自己造的（只有
                 // 真机那个值能当设备身份转出去，见 `docs_cpu_id`）。
-                let mut out = data_result(op, OK, product.as_bytes());
+                // 回 16 字节 raw：真机 TA 的 getDeviceId 出的是二进制，检测器会把它
+                // 转成 hex 再跟 cpu_id 对比（32 字符）。把 hex 文本当字节发出去，
+                // 检测器看到的是 "30393030…"，跟 cpu_id 对不上。
+                let raw = hex_bytes(&product).unwrap_or_default();
+                let mut out = data_result(op, OK, &raw);
                 out["layer"] = json!(layer);
                 Ok(out)
             }
@@ -708,7 +717,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                 if auth_key(device_id, body).is_some() {
                     OK
                 } else {
-                    NOT_FOUND
+                    AUTH_KEY_NOT_READY
                 },
             )),
             "export_auth_key_public_key" => match auth_key(device_id, body) {
@@ -723,7 +732,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                     out["layer"] = json!(layer);
                     Ok(out)
                 }
-                None => Ok(code_result(op, NOT_FOUND)),
+                None => Ok(code_result(op, AUTH_KEY_NOT_READY)),
             },
             "generate_auth_key_pair" => {
                 let fresh = MintKey::generate().context("RSA keygen for the auth key failed")?;
@@ -772,8 +781,9 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                 let uid = uid_of(body)?;
                 let alias = alias_of(body)?;
                 if auth_key(device_id, body).is_none() {
-                    // 没有 AuthKey 就是没有，-5；跟真机上"这把钥匙不在"是同一个码。
-                    return Ok(code_result(op, NOT_FOUND));
+                    // AuthKey 没建就是没建，真机这里答 -6（AUTH_KEY_NOT_READY）；
+                    // 答 -5 会被上层当成「ASK 还没准备好」。
+                    return Ok(code_result(op, AUTH_KEY_NOT_READY));
                 }
                 let raw = body
                     .get("challenge")
@@ -831,7 +841,7 @@ pub fn run(layer: &str, device_id: &str, body: &Value, key_pem: Option<&str>) ->
                     m.remove(&session)
                 }) {
                     Some(s) => s,
-                    None => return Ok(code_result(op, NOT_FOUND)),
+                    None => return Ok(code_result(op, SESSION_UNKNOWN)),
                 };
                 let key = match store().auth.lock().ok().and_then(|m| {
                     m.get(&format!(
@@ -913,6 +923,23 @@ fn docs_cpu_id(body: &Value) -> Option<String> {
 /// 以后换代次也不用改）。
 fn is_soter_cpu_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// 32 字符 hex 转 16 字节。真机 getDeviceId 出的是二进制，不是文本。
+fn hex_bytes(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char).to_digit(16)?;
+        let lo = (bytes[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
 }
 
 /// 请求里没带 cpu_id 时现造一个设备号：`09000000` +
@@ -1076,6 +1103,14 @@ pub fn split_ask_payload(data: &[u8]) -> Result<(&[u8], &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把应答里的 `data`（base64）还原成 hex 文本，好跟 cpu_id 那样的 32 字符串直接比。
+    fn hex_of_data(value: &Value) -> String {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(value["data"].as_str().expect("data"))
+            .expect("base64");
+        raw.iter().map(|b| format!("{b:02x}")).collect()
+    }
     use rsa::pss::{Signature as PssSignature, VerifyingKey as PssVerifyingKey};
     use rsa::signature::Verifier;
 
@@ -1183,7 +1218,7 @@ mod tests {
             None,
         )
         .expect("handled");
-        assert_eq!(id["text"], json!(forwarded));
+        assert_eq!(hex_of_data(&id), forwarded);
         // 层名是给 A 端分辨「这个号是真机报的还是服务端造的」用的。
         assert_eq!(id["layer"], json!("self_signed"));
 
@@ -1209,11 +1244,11 @@ mod tests {
             None,
         )
         .expect("handled");
-        assert_eq!(plain["text"], json!(time_device_id()));
+        assert_eq!(hex_of_data(&plain), time_device_id());
         assert_eq!(plain["layer"], json!("self_signed"));
         assert_ne!(
-            plain["text"],
-            json!(virtual_device_id(device)),
+            hex_of_data(&plain),
+            virtual_device_id(device),
             "不再用按设备名派生的虚拟号"
         );
     }
@@ -1237,7 +1272,7 @@ mod tests {
                 None,
             )
             .expect("handled");
-            let text = id["text"].as_str().expect("text");
+            let text = hex_of_data(&id);
             assert_eq!(text.len(), 32, "{bad:?}");
             assert!(text.starts_with("09000000"), "{bad:?}: {text}");
             assert!(
@@ -1290,7 +1325,7 @@ mod tests {
             None,
         )
         .expect("handled");
-        assert_eq!(absent["error_code"], json!(NOT_FOUND));
+        assert_eq!(absent["error_code"], json!(AUTH_KEY_NOT_READY));
 
         let generated = run(
             "self_signed",
@@ -1592,7 +1627,7 @@ mod tests {
         let finish = json!({"device_id": device, "op": "finish_sign", "session": session});
         assert_eq!(
             run("self_signed", "other", &finish, None).unwrap()["error_code"],
-            json!(NOT_FOUND)
+            json!(SESSION_UNKNOWN)
         );
         assert_eq!(
             session_layer(device, session).as_deref(),
@@ -1605,7 +1640,7 @@ mod tests {
         assert_eq!(session_layer(device, session), None);
         assert_eq!(
             run("self_signed", device, &finish, None).unwrap()["error_code"],
-            json!(NOT_FOUND)
+            json!(SESSION_UNKNOWN)
         );
     }
 
@@ -1733,15 +1768,15 @@ mod tests {
             call(json!({"op": "has_ask_already", "uid": uid}))["error_code"],
             json!(NOT_FOUND)
         );
-        // 没建过的钥匙就是没建过，跟真机同一个码。
+        // 没建过的钥匙就是没建过，真机答 -6（AUTH_KEY_NOT_READY）。
         assert_eq!(
             call(json!({"op": "has_auth_key", "uid": uid, "alias": alias}))["error_code"],
-            json!(NOT_FOUND)
+            json!(AUTH_KEY_NOT_READY)
         );
         assert_eq!(
             call(json!({"op": "init_sign", "uid": uid, "alias": alias, "challenge": "0a1b"}))
                 ["error_code"],
-            json!(NOT_FOUND)
+            json!(AUTH_KEY_NOT_READY)
         );
 
         assert_eq!(
@@ -1783,7 +1818,7 @@ mod tests {
         );
         assert_eq!(
             call(json!({"op": "has_auth_key", "uid": uid, "alias": alias}))["error_code"],
-            json!(NOT_FOUND)
+            json!(AUTH_KEY_NOT_READY)
         );
     }
 

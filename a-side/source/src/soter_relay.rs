@@ -403,13 +403,23 @@ fn with_caller_pkg(mut value: Value) -> Value {
     if has_caller_pkg(&value) {
         return value;
     }
+    let app_uid = value.get("uid").and_then(Value::as_i64);
     let pkg = value
         .get(CALLER_UID_FIELD)
         .and_then(Value::as_i64)
         .and_then(caller_package_for_uid)
         .or_else(|| {
-            // 没有 `caller_uid`（宿主那套 App 面向接口我们认不出来），或者有 uid 但翻不出包名：
-            // 用 root 侧写的“当前前台应用”兜底。
+            // `caller_uid` 是内核给的，只有「注在宿主进程里」那条路才有意义。
+            // `soterta-ta` 是独立 HAL，调它的是 soterserver（uid 1000），内核那格拿到
+            // 的不是 App —— 它甚至会把一堆共享 uid 的系统包一起翻出来（实测 SoterChecker
+            // 被判成 com.android.dynsystem,com.zte.*，整轮退回本地）。
+            //
+            // SOTER 接口本来就把 App uid 当参数传（原厂 TA 也只认这个），而且宿主就是
+            // 拿它转发进来的，所以退一级用它翻。
+            app_uid.and_then(caller_package_for_uid)
+        })
+        .or_else(|| {
+            // 两个都没有：用 root 侧写的“当前前台应用”兜底。
             //
             // 这一步为什么必须放在这里：以前它接在 `caller_package_for_uid` 的失败分支里，
             // 而“没有 caller_uid”是**更早**的 `return`（实测小米那台就是这样）—— 文件压根
@@ -627,7 +637,34 @@ fn encode_reply(op: &str, reply: &Value) -> Option<Outcome> {
         }
         _ => None,
     };
+    // `get_device_id`：真机 / SDK 给的是 **32 字符 hex 文本**（有的还跟一个 NUL），而检测器
+    // 要的是 16 字节原始值（转 hex 后跟 `cpu_id` 比）。本地兜底那条路已经转了
+    // （`soter_local::hex_bytes`），转发这条路以前没转，检测器就看到 `30393030…` ——
+    // ASCII 的 "0900"，C5b 直接对不上。已经是 16 字节的原样放过，幂等。
+    let data = if op == "get_device_id" {
+        match data.as_deref().and_then(hex_text_32) {
+            Some(raw) => Some(raw),
+            None => data,
+        }
+    } else {
+        data
+    };
     Some(Outcome::Buffer { code, data })
+}
+
+/// 32 字符 hex 文本 → 16 字节；容一个尾随 NUL（部分厂商 TA 会带）。其余一律 `None`。
+fn hex_text_32(bytes: &[u8]) -> Option<Vec<u8>> {
+    let text = core::str::from_utf8(bytes).ok()?.trim_end_matches('\0');
+    if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(16);
+    let mut i = 0;
+    while i < 32 {
+        out.push(u8::from_str_radix(&text[i..i + 2], 16).ok()?);
+        i += 2;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -638,20 +675,24 @@ mod tests {
     /// 真机实测拿回来的应答（见 `D:\ace5u-forensics` 那份状态文档），字段名和形状都是
     /// 服务端真实输出，不是照着代码猜的。
     #[test]
-    fn a_device_id_answer_keeps_its_trailing_nul() {
+    fn a_device_id_answer_is_16_raw_bytes() {
+        // 服务端 2026-10-21 起回 16 字节 raw（原来回的是 32 字符 hex 的 ASCII 再加 NUL）。
+        // 检测器的 getDeviceId 期望 16 字节，转 hex 后再跟 cpu_id 比。
         let reply = json!({
-            "data": "MDkwMDAwMDA1MTcxNzM0YzQyODY2YmVhMTQ4YjIxZjUA",
+            "data": "CQAAAFFxc0xChmvqFIsh9Q==",
             "error_code": 0,
-            "length": 33,
-            "op": "get_device_id",
-            "text": "090000005171734c42866bea148b21f5"
+            "length": 16,
+            "op": "get_device_id"
         });
         let outcome = encode_reply("get_device_id", &reply).expect("a real reply must map");
         assert_eq!(
             outcome,
             Outcome::Buffer {
                 code: 0,
-                data: Some(b"090000005171734c42866bea148b21f5\0".to_vec()),
+                data: Some(vec![
+                    0x09, 0x00, 0x00, 0x00, 0x51, 0x71, 0x73, 0x4c, 0x42, 0x86, 0x6b, 0xea, 0x14,
+                    0x8b, 0x21, 0xf5,
+                ]),
             }
         );
     }

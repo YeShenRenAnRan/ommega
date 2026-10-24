@@ -45,7 +45,7 @@ const CLIENTA_LOG_FLAG_PATH: &str = "/data/misc/ommega/log_flag";
 /// 同一份开关的另一个副本（root / `su` 域看这个）。曾经 daemon-injector 只写这一份、
 /// payload 只读上面那一份，两边对不上：SOTER 宿主读到的是一份没人更新的旧值，
 /// 于是日志在 03:21 之后一个字都不再写。现在两份都写、两份都读，先读能读到的那个。
-const CLIENTA_LOG_FLAG_FALLBACK_PATH: &str = "/data/adb/ommega/log_flag";
+const CLIENTA_LOG_FLAG_FALLBACK_PATH: &str = "/data/adb/ommega/conf/log_flag";
 const CURRENT_CONFIG_VERSION: u32 = 1;
 const REPLACE_SAVE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REPLACE_SAVE_RETRY_LIMIT: usize = 10;
@@ -158,7 +158,9 @@ impl Default for FilterConfig {
             deny_packages: Vec::new(),
             block_android_package: true,
             allow_unknown_package: false,
-            global_scope: false,
+            // 默认开：全局作用域（只接管 app uid 和显式绑定的系统 app 域，系统进程
+            // 始终留系统后端）。要恢复“只看 scoop / target.txt”就在面板里关掉。
+            global_scope: true,
             allow_system_sids: vec!["engineermode".to_string()],
             system_sid_packages: BTreeMap::from([(
                 "engineermode".to_string(),
@@ -360,7 +362,21 @@ fn apply_clienta_overrides(base: Arc<InjectorConfig>) -> Arc<InjectorConfig> {
         merged.filter.global_scope = value;
     }
     if let Some(list) = overrides.target.as_ref() {
-        merged.scoop = list.clone();
+        // 系统 uid 的 ROM app（工程模式那类）必须**始终**留在 scoop 里：
+        // 它们的包名命中 `SYSTEM_PACKAGE_PREFIXES`（`com.oplus.` 等），只有被
+        // 显式收进去才过得了 `RejectedSystemPackage` 那关。而面板一保存应用列表
+        // 就会把 target.txt 写成唯一事实源、整个替掉默认套餐 —— 工程模式就从
+        // scoop 里消失了，它的 attestation 就只能落回系统 keystore（工模里
+        // keybox / rpmbkey 页拿不到我们的链）。这里把域→包名映射里的包补回来。
+        let mut effective = list.clone();
+        for packages in base.filter.system_sid_packages.values() {
+            for pkg in packages {
+                if !pkg.is_empty() && !effective.iter().any(|existing| existing == pkg) {
+                    effective.push(pkg.clone());
+                }
+            }
+        }
+        merged.scoop = effective;
     }
     Arc::new(merged)
 }
@@ -423,6 +439,10 @@ pub fn clienta_debug_logging() -> Option<bool> {
 /// Reads one boolean key out of a flat `key: value` config file.  `None` when
 /// the file is unreadable or the key is missing; a present key always wins, so
 /// `false` has to be spelled out to turn something off.
+///
+/// 跟 keymint 侧 `src/config.rs` 的 `parse_flat_config` 是同一套格式，但这里是独立
+/// crate（payload），而且要多照顾一条「uid 1000 读不到真配置、用启动器写下的副本」
+/// 的路，所以没共享实现。**改 `key: value` 的格式时两边都要动。**
 fn clienta_config_bool(path: &Path, keys: &[&str]) -> Option<bool> {
     let contents = fs::read_to_string(path).ok()?;
     for line in contents.lines() {

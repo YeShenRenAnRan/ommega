@@ -248,6 +248,17 @@ pub async fn admin_devices(State(state): State<AppState>, headers: HeaderMap) ->
                 "version": d.version,
                 "module": d.module_kind(),
                 "strongbox": d.supports_strongbox,
+                // 本机设备身份（relay 心跳上报）：A 端「伪装参数 → 从服务器同步」
+                // 直接拿它去 resetprop，把本机属性对齐到这台 B。
+                "identity": json!({
+                    "brand": d.identity.brand,
+                    "device": d.identity.device,
+                    "product": d.identity.product,
+                    "manufacturer": d.identity.manufacturer,
+                    "model": d.identity.model,
+                    "serial": d.identity.serial,
+                    "fingerprint": d.identity.fingerprint,
+                }),
             }),
             load,
         ));
@@ -531,6 +542,13 @@ pub struct TokenGenBody {
     pub role: String, // "a" | "b"
     pub duration_seconds: i64,
     pub note: Option<String>,
+    /// 卡类型：`pair`（私卡，要和另一端的同 pair_id 配对）/ `public`（公开测试卡，
+    /// 能访问任意另一端）/ 空（老卡密，任意互通）。
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// 私卡的配对组；**可以留空**，之后再在列表里编辑补上。
+    #[serde(default)]
+    pub pair_id: Option<String>,
 }
 
 /// GET /api/admin/tokens/ — list all API tokens.
@@ -557,6 +575,8 @@ pub async fn admin_tokens(State(state): State<AppState>, headers: HeaderMap) -> 
                     "created_at": t.created_at,
                     "last_ip": t.last_ip,
                     "last_used_at": t.last_used_at,
+                    "kind": t.kind,
+                    "pair_id": t.pair_id,
                 })
             })
             .collect(),
@@ -591,13 +611,38 @@ pub async fn admin_generate_token(
     if body.duration_seconds <= 0 {
         return json_err(StatusCode::BAD_REQUEST, "duration_seconds must be positive");
     }
+    let kind = body.kind.clone().unwrap_or_default().to_ascii_lowercase();
+    if kind != "" && kind != "pair" && kind != "public" {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "kind must be '', 'pair' or 'public'",
+        );
+    }
+    let pair_id = body.pair_id.clone().unwrap_or_default();
+    if kind == "pair" && pair_id.len() > 64 {
+        return json_err(StatusCode::BAD_REQUEST, "pair_id too long (<= 64)");
+    }
+
+    // 单条：role 必填。
+    if body.role != "a" && body.role != "b" {
+        return json_err(StatusCode::BAD_REQUEST, "role must be 'a' or 'b'");
+    }
     let token = crate::util::generate_token_string();
     let token_clone = token.clone();
     let note = body.note.clone().unwrap_or_default();
     let role = body.role.clone();
     let duration = body.duration_seconds;
+    let kind_owned = kind.clone();
+    let pair_owned = pair_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        db.insert_api_token(&token_clone, &role, duration, &note)
+        db.insert_api_token_full(
+            &token_clone,
+            &role,
+            duration,
+            &note,
+            &pair_owned,
+            &kind_owned,
+        )
     })
     .await;
     match result {
@@ -605,6 +650,8 @@ pub async fn admin_generate_token(
             "status": "ok",
             "token": token,
             "role": body.role,
+            "kind": body.kind.clone().unwrap_or_default(),
+            "pair_id": body.pair_id.clone().unwrap_or_default(),
             "duration_seconds": body.duration_seconds,
         }))
         .into_response(),
@@ -618,7 +665,12 @@ pub async fn admin_generate_token(
 
 #[derive(serde::Deserialize)]
 pub struct TokenToggleBody {
-    pub enabled: bool,
+    /// 不传 = 不改开关（只改 pair_id 时用）。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 不传 = 不改；传空字符串 = 取消配对。
+    #[serde(default)]
+    pub pair_id: Option<String>,
 }
 
 /// POST /api/admin/tokens/:id/ — enable/disable a token.
@@ -635,11 +687,25 @@ pub async fn admin_toggle_token(
         return json_err(StatusCode::NOT_FOUND, "no db");
     };
     let enabled = body.enabled;
-    let result = tokio::task::spawn_blocking(move || db.set_token_enabled(id, enabled)).await;
-    match result {
-        Ok(Ok(())) => {
-            Json(json!({ "status": "ok", "id": id, "enabled": body.enabled })).into_response()
+    let pair_id = body.pair_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(e) = enabled {
+            db.set_token_enabled(id, e)?;
         }
+        if let Some(p) = pair_id.as_deref() {
+            db.set_token_pair_id(id, p)?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Json(json!({
+            "status": "ok",
+            "id": id,
+            "enabled": body.enabled,
+            "pair_id": body.pair_id,
+        }))
+        .into_response(),
         Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db error: {e}")),
         Err(e) => json_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1165,14 +1231,140 @@ pub async fn admin_strongbox_toggle(
 }
 
 // ---------------------------------------------------------------------------
+// Attest layer-order switches (keybox first / device-ID attest server side).
+//
+// These used to be env-only (RELAY_ATTEST_KEYBOX_FIRST /
+// RELAY_ID_ATTEST_SERVER_SIDE): invisible on the console and requiring a
+// restart. The values now live in `crate::attest_policy` (runtime + persisted
+// to data/attest_policy.json), so saving the panel takes effect immediately.
+// ---------------------------------------------------------------------------
+
+/// GET /api/admin/attest_policy/ - current layer-order policy.
+///
+/// `auto` (the default) simply means "follow the mode" (local minting -> server
+/// keybox first, physical -> real device first). `b_first` / `keybox_first` are
+/// troubleshooting overrides only.
+pub async fn admin_attest_policy_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    let (attest, id_attest) = crate::attest_policy::snapshot();
+    let persisted = std::path::Path::new(crate::attest_policy::PATH).is_file();
+    let serverbox = crate::config::Config::load().server_keybox_enabled();
+    Json(json!({
+        "status": "ok",
+        "attest_order": attest.as_str(),
+        "id_attest_order": id_attest.as_str(),
+        "mode": if serverbox { "server_keybox" } else { "physical" },
+        "persisted": persisted,
+        "path": crate::attest_policy::PATH,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct AttestPolicyBody {
+    /// `auto` | `b_first` | `keybox_first` for ordinary attest.
+    #[serde(default)]
+    pub attest_order: Option<String>,
+    /// Same tokens, for attestations that carry device IDs.
+    #[serde(default)]
+    pub id_attest_order: Option<String>,
+    /// Legacy boolean: true -> keybox_first, false -> auto.
+    #[serde(default)]
+    pub keybox_first: Option<bool>,
+    /// Legacy boolean: true -> keybox_first, false -> auto.
+    #[serde(default)]
+    pub id_attest_server_side: Option<bool>,
+}
+
+/// POST /api/admin/attest_policy/ - change the layer-order policy.
+pub async fn admin_attest_policy_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AttestPolicyBody>,
+) -> Response {
+    if let Err(r) = check_auth(&state, &headers) {
+        return *r;
+    }
+    fn parse(
+        name: &str,
+        token: Option<&String>,
+        legacy: Option<bool>,
+    ) -> Result<Option<crate::attest_policy::Order>, Response> {
+        if let Some(tok) = token {
+            return match tok.parse::<crate::attest_policy::Order>() {
+                Ok(o) => Ok(Some(o)),
+                Err(_) => Err(json_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "invalid {name} {tok:?}: expected \"auto\" | \"b_first\" | \"keybox_first\""
+                    ),
+                )),
+            };
+        }
+        Ok(legacy.map(|b| {
+            if b {
+                crate::attest_policy::Order::KeyboxFirst
+            } else {
+                crate::attest_policy::Order::Auto
+            }
+        }))
+    }
+
+    let attest = match parse(
+        "attest_order",
+        body.attest_order.as_ref(),
+        body.keybox_first,
+    ) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let id_attest = match parse(
+        "id_attest_order",
+        body.id_attest_order.as_ref(),
+        body.id_attest_server_side,
+    ) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if attest.is_none() && id_attest.is_none() {
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "nothing to change: pass attest_order and/or id_attest_order",
+        );
+    }
+    if let Err(e) = crate::attest_policy::set(attest, id_attest) {
+        return json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to persist attest policy: {e}"),
+        );
+    }
+    let (attest, id_attest) = crate::attest_policy::snapshot();
+    Json(json!({
+        "status": "ok",
+        "attest_order": attest.as_str(),
+        "id_attest_order": id_attest.as_str(),
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Default device id (A side leaves `device_id` empty).
 // ---------------------------------------------------------------------------
 
-/// GET /api/admin/default_device/ — 当前「默认设备 id」+ 在线情况。
+/// GET /api/admin/default_device/ — 当前「默认设备 id」（两条链路各一个）+ 在线情况。
 ///
 /// A 端在远程模式下把 `device_id` 留空（模块装好就是空的，面板不用占位一台设备），
-/// 请求照样上来，服务端按这里配的值落 B；没配就按负载挑一台在线的。
-/// 返回里 `online` 是「配的那台现在在不在线」（`null` = 没配）。
+/// 请求照样上来，服务端按链路分别落 B：
+/// - KeyMint 链（attest / sign / decrypt）用 `keymint_device_id`；
+/// - SOTER 链用 `soter_device_id`。
+///
+/// 没配就按负载挑一台在线的。返回里 `*_online` 是「配的那台现在在不在线」
+/// （`null` = 没配）。
 pub async fn admin_default_device_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1180,21 +1372,25 @@ pub async fn admin_default_device_status(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let configured = crate::default_device::get();
+    let (keymint, soter) = crate::default_device::get_all();
     let mut connected = state.store.get_connected_devices().await;
     connected.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-    let online = if configured.is_empty() {
-        None
-    } else {
-        Some(connected.iter().any(|d| d.device_id == configured))
+    let online = |id: &str| {
+        if id.is_empty() {
+            None
+        } else {
+            Some(connected.iter().any(|d| d.device_id == id))
+        }
     };
     // 只回「配的那台在不在线」+ 在线总数。别把整张设备表倒出去：在线 B 是几百台级别，
     // 这个接口每开一次面板就被拉一次，返回体会越长越大（2026-10-18 实测 200+ 台）。
     // 需要具体 id 的地方自己走 `/api/admin/devices/` 或 `/api/status/`。
     Json(json!({
         "status": "ok",
-        "device_id": configured,
-        "online": online,
+        "keymint_device_id": keymint,
+        "soter_device_id": soter,
+        "keymint_online": online(&keymint),
+        "soter_online": online(&soter),
         "online_total": connected.len(),
     }))
     .into_response()
@@ -1202,14 +1398,21 @@ pub async fn admin_default_device_status(
 
 #[derive(serde::Deserialize)]
 pub struct DefaultDeviceBody {
-    /// 目标设备 id。空字符串 = 清掉（回到按负载挑）。
+    /// 老字段：两条链路一起设（兼容旧面板）。
     #[serde(default)]
-    pub device_id: String,
+    pub device_id: Option<String>,
+    /// KeyMint 链（attest / sign / decrypt）的默认设备。空字符串 = 清掉。
+    #[serde(default)]
+    pub keymint_device_id: Option<String>,
+    /// SOTER 链的默认设备。空字符串 = 清掉。
+    #[serde(default)]
+    pub soter_device_id: Option<String>,
 }
 
 /// POST /api/admin/default_device/ — 保存「默认设备 id」。
 ///
 /// 落盘到 `data/default_device.json`，重启后仍然生效；写空就是清掉。
+/// 两条链路互不影响：只传 `keymint_device_id` 时 SOTER 那台一个字都不动。
 pub async fn admin_default_device_set(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1218,21 +1421,45 @@ pub async fn admin_default_device_set(
     if let Err(r) = check_auth(&state, &headers) {
         return *r;
     }
-    let saved = match crate::default_device::set(&body.device_id) {
-        Ok(v) => v,
-        Err(e) => return json_err(StatusCode::BAD_REQUEST, &e),
+    // 老字段 `device_id` 一次性盖两条（旧面板的行为）；新面板走两条各自的字段。
+    let targets: Vec<(crate::default_device::Chain, String)> = if let Some(legacy) = &body.device_id
+    {
+        vec![
+            (crate::default_device::Chain::Keymint, legacy.clone()),
+            (crate::default_device::Chain::Soter, legacy.clone()),
+        ]
+    } else {
+        let mut v = Vec::new();
+        if let Some(id) = &body.keymint_device_id {
+            v.push((crate::default_device::Chain::Keymint, id.clone()));
+        }
+        if let Some(id) = &body.soter_device_id {
+            v.push((crate::default_device::Chain::Soter, id.clone()));
+        }
+        v
     };
-    if !saved.is_empty() {
-        let connected = state.store.get_connected_devices().await;
-        if !connected.iter().any(|d| d.device_id == saved) {
+    for (chain, raw) in targets {
+        if let Err(e) = crate::default_device::set(chain, &raw) {
+            return json_err(StatusCode::BAD_REQUEST, &e);
+        }
+    }
+    let (keymint, soter) = crate::default_device::get_all();
+    let connected = state.store.get_connected_devices().await;
+    for (chain, id) in [
+        (crate::default_device::Chain::Keymint, &keymint),
+        (crate::default_device::Chain::Soter, &soter),
+    ] {
+        if !id.is_empty() && !connected.iter().any(|d| d.device_id == *id) {
             tracing::warn!(
-                "default_device: 保存了 {saved}，但它当前不在线（A 端留空的请求会按负载落别的 B）"
+                "default_device: {} 链保存了 {id}，但它当前不在线（留空的请求会按负载落别的 B）",
+                chain.as_str()
             );
         }
     }
     Json(json!({
         "status": "ok",
-        "device_id": saved,
+        "keymint_device_id": keymint,
+        "soter_device_id": soter,
     }))
     .into_response()
 }
@@ -1311,6 +1538,17 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
                 "version": d.version,
                 "module": d.module_kind(),
                 "strongbox": d.supports_strongbox,
+                // 本机设备身份（relay 心跳上报）：A 端「伪装参数 → 从服务器同步」
+                // 直接拿它去 resetprop，把本机属性对齐到这台 B。
+                "identity": json!({
+                    "brand": d.identity.brand,
+                    "device": d.identity.device,
+                    "product": d.identity.product,
+                    "manufacturer": d.identity.manufacturer,
+                    "model": d.identity.model,
+                    "serial": d.identity.serial,
+                    "fingerprint": d.identity.fingerprint,
+                }),
             }),
             load,
         ));
@@ -1360,6 +1598,9 @@ pub async fn public_status(State(state): State<AppState>) -> Response {
         "mode": if state.fulfill.is_enabled() { "serverbox" } else { "physical" },
         "online_b_devices": connected,
         "cert_devices": cert_devices,
+        // A 端面板「从服务器同步」优先跟这台 KeyMint 设备；它不可用/不在线
+        // 时再按原来的规则（锁、验证启动、负载）自动挑。
+        "default_keymint_device_id": crate::default_device::get(crate::default_device::Chain::Keymint),
         "server_time_ms": chrono::Utc::now().timestamp_millis(),
     }))
     .into_response()

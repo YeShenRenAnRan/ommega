@@ -15,12 +15,18 @@
 // lib 里 `pub` 算对外 API 不报，bin 里同一份 `pub` 就成了「never used」，
 // 于是每次 clippy 都多出一批只跟目标有关的假警告，把真问题盖住。
 
+// musl 的 malloc 多线程下只有一个全局锁，并发出证时全堵这儿；换 mimalloc。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 
 use axum::extract::ConnectInfo;
 use axum::middleware;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -42,6 +48,18 @@ async fn serve_bg() -> impl axum::response::IntoResponse {
 }
 
 /// Card purchase page (public).
+/// Serve the WeChat reward QR code uploaded by the operator (data/paycode.png).
+async fn serve_paycode() -> axum::response::Response {
+    match tokio::fs::read("data/paycode.png").await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Err(_) => (
+            axum::http::StatusCode::NOT_FOUND,
+            "paycode.png not uploaded",
+        )
+            .into_response(),
+    }
+}
+
 async fn card_page() -> impl axum::response::IntoResponse {
     axum::response::Html(include_str!("card_ui.html"))
 }
@@ -186,6 +204,7 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         .route("/login/", get(admin::login_page))
         // Static background image (compiled into the binary)
         .route("/static/bg.png", get(serve_bg))
+        .route("/paycode.png", get(serve_paycode))
         .route("/api/admin/login/", post(admin::admin_login))
         .route("/api/admin/logout/", post(admin::admin_logout))
         .route("/api/admin/session/", get(admin::admin_session))
@@ -242,6 +261,10 @@ fn build_router(cfg: &Arc<Config>) -> Router {
         )
         .route("/api/admin/strongbox/", get(admin::admin_strongbox_status))
         .route("/api/admin/strongbox/", post(admin::admin_strongbox_toggle))
+        .route(
+            "/api/admin/attest_policy/",
+            get(admin::admin_attest_policy_status).post(admin::admin_attest_policy_set),
+        )
         .route("/api/admin/tokens/:token/ips/", get(admin::admin_token_ips))
         .route("/api/admin/tokens/:id/", post(admin::admin_toggle_token))
         .route(
@@ -276,6 +299,10 @@ async fn main() -> anyhow::Result<()> {
     relay_rs::statedb::open_checked()?;
     // 「默认设备 id」：A 端留空时用哪台 B。文件/环境变量读一次，之后控制台可改。
     relay_rs::default_device::init();
+    // Attest layer-order switches: env vars seed the defaults, the persisted
+    // file (data/attest_policy.json) wins afterwards. The console can flip them
+    // at runtime without a restart.
+    relay_rs::attest_policy::init();
     tracing::info!(
         "relay_rs starting: version={} mode={} bind={} http={} https={} tls={}",
         relay_rs::config::VERSION,
@@ -292,15 +319,27 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_router(&cfg);
 
-    // HTTP server
+    // HTTP server. `RELAY_HTTP_PORT=0` 表示不监听明文端口（拆分部署时给只走
+    // TLS 的实例用），这时只是把 HTTP 那半边关掉，HTTPS 那段照旧。
+    let http_enabled = cfg.http_port != 0;
     let http_addr = format!("{}:{}", cfg.bind_addr, cfg.http_port);
-    let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
-    tracing::info!("HTTP listening on {http_addr}");
-    let http_server = axum::serve(
-        http_listener,
-        app.clone()
-            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    );
+    if !http_enabled {
+        tracing::info!("HTTP disabled (RELAY_HTTP_PORT=0)");
+    }
+    let http_server = if http_enabled {
+        let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
+        tracing::info!("HTTP listening on {http_addr}");
+        Some(
+            axum::serve(
+                http_listener,
+                app.clone()
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .into_future(),
+        )
+    } else {
+        None
+    };
 
     // HTTPS server (if TLS enabled and cert files exist)
     if cfg.use_tls {
@@ -321,10 +360,17 @@ async fn main() -> anyhow::Result<()> {
                 app.clone()
                     .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             );
-            // Run both servers concurrently.
-            tokio::select! {
-                r = http_server => { r?; }
-                r = https_server => { r?; }
+            // Run both servers concurrently (HTTP only when enabled).
+            match http_server {
+                Some(hs) => {
+                    tokio::select! {
+                        r = hs => { r?; }
+                        r = https_server => { r?; }
+                    }
+                }
+                None => {
+                    https_server.await?;
+                }
             }
             return Ok(());
         }
@@ -335,6 +381,8 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    http_server.await?;
+    if let Some(hs) = http_server {
+        hs.await?;
+    }
     Ok(())
 }
